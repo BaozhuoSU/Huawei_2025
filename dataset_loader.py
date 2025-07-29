@@ -3,6 +3,7 @@ import torch
 import os
 from typing import Tuple, List, Dict, Optional
 from torch.utils.data import Dataset, DataLoader, random_split, ConcatDataset
+import matplotlib.pyplot as plt
 
 
 class MIMODataset(Dataset):
@@ -201,37 +202,39 @@ def create_train_val_datasets(
 if __name__ == "__main__":
     # Example usage
     data_dir = "CompetitionData1"
-    try:
-        # Create training and validation DataLoaders (using 20% of data for validation)
-        train_loader, val_loader = create_train_val_datasets(
-            data_dir=data_dir,
-            round_idx=[1, 2, 3],
-            val_split=0.2,
-            batch_size=32,
-            shuffle=True
-        )
-
-        # Verify dataset sizes
-        train_dataset = train_loader.dataset
-        val_dataset = val_loader.dataset
-        print(f"Combined training dataset size: {len(train_dataset)}")
-        print(f"Combined validation dataset size: {len(val_dataset)}")
-
-        # # Print data and labels for one batch from each round
-        # for round_idx in [1, 2, 3]:
-        #     print(f"\nRound {round_idx}:")
-        #     dataset = MIMODataset(data_dir, mode='train', round_idx=round_idx-1)  # 0-based
-        #     loader = DataLoader(dataset, batch_size=32, shuffle=False, num_workers=0)
-        #     data, labels, config = next(iter(loader))
-        #     print(f"Config: {config}")
-        #     print(f"Data shape: {data.shape}, dtype: {data.dtype}")
-        #     print(f"Labels shape: {labels.shape}, dtype: {labels.dtype}")
-        #     print(f"Data sample (first element):\n{data[0]}")
-        #     print(f"Labels sample (first element):\n{labels[0]}")
+    # try:
+    #     # Create training and validation DataLoaders (using 20% of data for validation)
+    #     train_loader, val_loader = create_train_val_datasets(
+    #         data_dir=data_dir,
+    #         round_idx=[1, 2, 3],
+    #         val_split=0.2,
+    #         batch_size=32,
+    #         shuffle=True
+    #     )
+    #
+    #     # Verify dataset sizes
+    #     train_dataset = train_loader.dataset
+    #     val_dataset = val_loader.dataset
+    #     print(f"Combined training dataset size: {len(train_dataset)}")
+    #     print(f"Combined validation dataset size: {len(val_dataset)}")
+    #
+    #
+    #     data, labels, _ = next(iter(train_loader))
+    #     print(data.shape)
+    #
+    # except (FileNotFoundError, ValueError) as e:
+    #     print(f"Error: {e}")
 
 
-        data, labels, _ = next(iter(train_loader))
-        print(data.shape)
+    dataset = MIMODataset(data_dir, mode='train', round_idx=0)
 
-    except (FileNotFoundError, ValueError) as e:
-        print(f"Error: {e}")
+    config = dataset.config
+    N_sample = config['N_sample']
+    M = config['M']
+    N = config['N']
+    Q = config['Q']
+
+    data = dataset.data
+    H = data[0, :, :, :]
+    real_parts = H[:, :, 0]
+    imag_parts = H[:, :, 1]
