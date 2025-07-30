@@ -92,21 +92,22 @@ class EfficientSVDNet(nn.Module):
             # nn.BatchNorm2d(64),
             # nn.ReLU(True),
 
-            # nn.Conv2d(2, 32, 3, 1, 1),
-            # nn.ReLU(True),
-            # nn.MaxPool2d(2),
-            # nn.Conv2d(32, 64, 3, 1, 1),
-            # nn.ReLU(True),
+            nn.Conv2d(2, 32, 3, 1, 1),
+            nn.ReLU(True),
+            nn.MaxPool2d(2),
+            nn.Conv2d(32, 64, 3, 1, 1),
+            nn.ReLU(True),
 
-            ResidualBlock(2, 32, stride=2),
-            ResidualBlock(32, 64, stride=1),
-
+            # ResidualBlock(2, 32, stride=2),
+            # ResidualBlock(32, 64, stride=1),
+            #
             CBAM(64, reduction_ratio=4, spatial_kernel_size=3),
         )
 
         self.u_proj = nn.Sequential(
             nn.Conv2d(64, r * 2, 1),
             nn.BatchNorm2d(r * 2),
+            nn.Dropout(0.1),
             nn.AdaptiveAvgPool2d((M, 1)),
             nn.Flatten(2)
         )
@@ -114,6 +115,7 @@ class EfficientSVDNet(nn.Module):
         self.v_proj = nn.Sequential(
             nn.Conv2d(64, r * 2, 1),
             nn.BatchNorm2d(r * 2),
+            nn.Dropout(0.1),
             nn.AdaptiveAvgPool2d((1, N)),
             nn.Flatten(2)
         )
@@ -135,10 +137,12 @@ class EfficientSVDNet(nn.Module):
         feat = self.conv(H_real)
 
         u_out = self.u_proj(feat).squeeze(-1)
+        u_out = torch.clamp(u_out, min=-1e3, max=1e3)
         U = torch.view_as_complex(u_out.view(-1, self.M, self.r, 2).contiguous())
         U = self.orthogonalize(U)
 
         v_out = self.v_proj(feat).squeeze(-2)
+        v_out = torch.clamp(v_out, min=-1e3, max=1e3)
         V = torch.view_as_complex(v_out.view(-1, self.N, self.r, 2).contiguous())
         V = self.orthogonalize(V)
 

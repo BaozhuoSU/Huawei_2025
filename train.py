@@ -4,6 +4,8 @@ from torch.utils.data import DataLoader, random_split, ConcatDataset
 from tqdm import tqdm
 import os
 import numpy as np
+
+from augment_dataset import AugmentChannelDataset
 from model import EfficientSVDNet
 from dataset import ChannelDataset, parse_cfg
 from loss import LAELoss
@@ -35,7 +37,7 @@ def build_full_dataset(scenarios):
         data_path = os.path.join(DATA_DIR, f"Round1TrainData{s_id}.npy")
         label_path = os.path.join(DATA_DIR, f"Round1TrainLabel{s_id}.npy")
         cfg_path = os.path.join(DATA_DIR, f"Round1CfgData{s_id}.txt")
-        datasets.append(ChannelDataset(data_path=data_path, label_path=label_path, cfg_path=cfg_path))
+        datasets.append(AugmentChannelDataset(data_path=data_path, label_path=label_path, cfg_path=cfg_path))
 
     full_dataset = ConcatDataset(datasets)
     return full_dataset, (M, N, r)
