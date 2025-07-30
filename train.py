@@ -9,6 +9,8 @@ from dataset import ChannelDataset, parse_cfg
 from loss import LAELoss
 from datetime import datetime
 
+from model_profiler import get_avg_flops
+
 DATA_DIR = "./CompetitionData1"
 best_model_path = None
 timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
@@ -19,13 +21,9 @@ log_file = os.path.join(log_dir, 'training_log.txt')
 SCENARIOS = ["1", "2", "3"]
 BATCH_SIZE = 512
 LEARNING_RATE = 2e-4
-EPOCHS = 5
+EPOCHS = 50
 VALIDATION_SPLIT = 0.1
 WEIGHT_DECAY = 1e-4
-
-with open(log_file, 'w') as f:
-    f.write(f"Training started at {datetime.now()}\n")
-    f.write(f"Batch sizes: Train={BATCH_SIZE}\n Learning rate: {LEARNING_RATE}\n weight decay: {WEIGHT_DECAY}\n Epochs: {EPOCHS}\n Validation split: {VALIDATION_SPLIT}\n")
 
 def build_full_dataset(scenarios):
     
@@ -43,6 +41,7 @@ def build_full_dataset(scenarios):
     return full_dataset, (M, N, r)
 
 def train_full_dataset(device):
+
     full_dataset, (M, N, r) = build_full_dataset(SCENARIOS)
     
     val_size = int(len(full_dataset) * VALIDATION_SPLIT)
@@ -58,7 +57,12 @@ def train_full_dataset(device):
     scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=LEARNING_RATE, epochs=EPOCHS, steps_per_epoch=len(train_loader))
     
     best_val_loss = float('inf')
-    
+
+    with open(log_file, 'w') as f:
+        f.write(f"Training started at {datetime.now()}\n")
+        f.write(
+            f"Batch sizes: Train={BATCH_SIZE}\n Learning rate: {LEARNING_RATE}\n weight decay: {WEIGHT_DECAY}\n Epochs: {EPOCHS}\n Validation split: {VALIDATION_SPLIT}\n")
+
     for epoch in range(EPOCHS):
         model.train()
         train_loss = 0.0
@@ -96,7 +100,7 @@ def train_full_dataset(device):
 
         with open(log_file, 'a') as f:
             f.write(
-                f"Epoch {epoch+1}: Train Loss : {avg_train_loss:.6f} Val Loss: {avg_val_loss:.6f}")
+                f"Epoch {epoch+1}: Train Loss : {avg_train_loss:.6f} Val Loss: {avg_val_loss:.6f}\n")
 
 
     print(f"Training finished! Best validation loss: {best_val_loss:.6f}")
