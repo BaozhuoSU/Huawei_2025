@@ -1,0 +1,120 @@
+# make_submission_npz.py
+
+import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
+from pathlib import Path
+from thop import profile, clever_format
+
+# 1. 简单测试集 Dataset，只返回实/虚通道
+class TestChannelDataset(Dataset):
+    def __init__(self, npy_path):
+        self.X = np.load(npy_path)  # (N, M, N, 2), float32
+    def __len__(self):
+        return self.X.shape[0]
+    def __getitem__(self, idx):
+        arr = self.X[idx]          # (M, N, 2)
+        # 转成 (2, M, N)
+        realimag = np.stack([arr[...,0], arr[...,1]], axis=0)
+        return torch.from_numpy(realimag).float()
+
+# 
+class SvdNet(torch.nn.Module):
+    def __init__(self, M, N, r):
+        super().__init__()
+        self.M, self.N, self.r = M, N, r
+        self.enc = torch.nn.Sequential(
+            torch.nn.Conv2d(2,12,3,1,1), torch.nn.ELU(),
+            torch.nn.Conv2d(12,24,3,1,1), torch.nn.ELU(),
+            torch.nn.MaxPool2d(2),
+            torch.nn.AdaptiveAvgPool2d(1),
+            torch.nn.Flatten()
+        )
+        self.fc = torch.nn.Sequential(
+            torch.nn.Linear(24,48), torch.nn.ELU(),
+            torch.nn.Linear(48, 2*M*r + 2*N*r)
+        )
+        # 保证 Σ bias 初始为正
+        with torch.no_grad():
+            self.fc[-1].bias[:r].fill_(0.5)
+
+    def forward(self, x):
+        B = x.size(0)
+        y = self.fc(self.enc(x))
+        p = 0
+        U_r = y[:,p:p+self.M*self.r].reshape(B,self.M,self.r); p+=self.M*self.r
+        U_i = y[:,p:p+self.M*self.r].reshape(B,self.M,self.r); p+=self.M*self.r
+        V_r = y[:,p:p+self.N*self.r].reshape(B,self.N,self.r); p+=self.N*self.r
+        V_i = y[:,p:p+self.N*self.r].reshape(B,self.N,self.r)
+        U = torch.complex(U_r, U_i)
+        V = torch.complex(V_r, V_i)
+        return U, V
+
+# 3. analytic_sigma with non-negative clamp
+@torch.no_grad()
+def analytic_sigma(U, V, x_realimag):
+    """
+    计算奇异值对角向量，并截断负值保证非负
+    """
+    H = x_realimag[:,0] + 1j * x_realimag[:,1]      # (B, M, N)
+    raw_S = (U.conj().permute(0,2,1) @ H @ V) \
+                .diagonal(dim1=1, dim2=2).real     # (B, r)
+    # 直接截断，消除负值
+    S = torch.clamp(raw_S, min=0.0)
+    return S                                        # (B, r)
+
+# 4. 修正后的 FLOPs 函数
+def get_avg_flops(model, dummy):
+    macs, _ = profile(model, inputs=(dummy,), verbose=False)
+    flops = macs / 2  # macs->FLOPs
+    flops_str = clever_format([flops], "%.3f")[0]
+    return float(flops_str)
+
+# 5. 打包 .npz 的主逻辑
+def pack_npz(model, device, data_dir, idx, batch_size=64):
+    npy_path = Path(data_dir)/f"Round1TestData{idx}.npy"
+    loader = DataLoader(TestChannelDataset(str(npy_path)),
+                        batch_size=batch_size, shuffle=False, num_workers=0)
+
+    model.eval()
+    U_list, S_list, V_list = [], [], []
+    with torch.no_grad():
+        for x in loader:
+            x = x.to(device)             # (B,2,M,N)
+            U, V = model(x)              # (B,M,r), (B,N,r)
+            S    = analytic_sigma(U, V, x)
+            U_list.append(U.cpu().numpy())
+            S_list.append(S.cpu().numpy())
+            V_list.append(V.cpu().numpy())
+
+    U_arr = np.concatenate(U_list, axis=0)  # (Ns, M, r)
+    S_arr = np.concatenate(S_list, axis=0)  # (Ns, r)
+    V_arr = np.concatenate(V_list, axis=0)  # (Ns, N, r)
+
+    # real/imag 扩到最后一维 Q=2
+    U_npz = np.stack([U_arr.real, U_arr.imag], axis=-1)  # (Ns, M, r, 2)
+    V_npz = np.stack([V_arr.real, V_arr.imag], axis=-1)  # (Ns, N, r, 2)
+
+    # 计算 MFLOPs/sample
+    M, N, r = U_arr.shape[1], V_arr.shape[1], U_arr.shape[2]
+    dummy = torch.randn(1,2,M,N).to(device)
+    C = get_avg_flops(model, dummy)
+
+    out = {
+        'U': U_npz.astype(np.float32),
+        'S': S_arr.astype(np.float32),
+        'V': V_npz.astype(np.float32),
+        'C': np.array([C], dtype=np.float32)
+    }
+    save_path = f"submission_data{idx}.npz"
+    np.savez(save_path, **out)
+    print(f"→ saved {save_path}: U{U_npz.shape}, S{S_arr.shape}, V{V_npz.shape}, C={C:.3f} MFLOPs")
+
+if __name__=='__main__':
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    M, N, r = 64, 64, 32
+    model = SvdNet(M,N,r).to(device)
+    model.load_state_dict(torch.load('svd_best_multi.pth', map_location=device))
+
+    for idx in (2,3,4):
+        pack_npz(model, device, f"data{idx}", idx)
