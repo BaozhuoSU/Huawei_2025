@@ -1,7 +1,7 @@
 import torch
 
 class LAELoss(torch.nn.Module):
-    def __init__(self, recon_weight=1.0, ortho_weight=0.1):
+    def __init__(self, recon_weight=1.0, ortho_weight=1.0):
         super(LAELoss, self).__init__()
         self.recon_weight = recon_weight
         self.ortho_weight = ortho_weight

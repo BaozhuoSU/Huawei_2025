@@ -6,11 +6,12 @@ import os
 import numpy as np
 
 from augment_dataset import AugmentChannelDataset
-from model import EfficientSVDNet
+from model import Model1
 from dataset import ChannelDataset, parse_cfg
 from loss import LAELoss
 from datetime import datetime
 
+from model2 import Model2
 from model_profiler import get_avg_flops
 
 DATA_DIR = "./CompetitionData1"
@@ -20,10 +21,11 @@ log_dir = f"model/{timestamp}"
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, 'training_log.txt')
 
-SCENARIOS = ["1", "2", "3"]
+# SCENARIOS = ["1", "2", "3"]
+SCENARIOS = ["1"]
 BATCH_SIZE = 512
 LEARNING_RATE = 2e-4
-EPOCHS = 50
+EPOCHS = 500
 VALIDATION_SPLIT = 0.1
 WEIGHT_DECAY = 1e-4
 
@@ -37,7 +39,7 @@ def build_full_dataset(scenarios):
         data_path = os.path.join(DATA_DIR, f"Round1TrainData{s_id}.npy")
         label_path = os.path.join(DATA_DIR, f"Round1TrainLabel{s_id}.npy")
         cfg_path = os.path.join(DATA_DIR, f"Round1CfgData{s_id}.txt")
-        datasets.append(AugmentChannelDataset(data_path=data_path, label_path=label_path, cfg_path=cfg_path))
+        datasets.append(AugmentChannelDataset(data_path=data_path, label_path=label_path, cfg_path=cfg_path, is_augment=True))
 
     full_dataset = ConcatDataset(datasets)
     return full_dataset, (M, N, r)
@@ -53,11 +55,13 @@ def train_full_dataset(device):
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)
     
-    model = EfficientSVDNet(M=M, N=N, r=r).to(device)
-    criterion = LAELoss()
+    model = Model2(M=M, N=N, r=r).to(device)
+    # model = Model1(M=M, N=N, r=r).to(device)
+    criterion = LAELoss(1, 1)
+    # criterion = ApproximationErrorLoss(M, N, r).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=LEARNING_RATE, epochs=EPOCHS, steps_per_epoch=len(train_loader))
-    
+
     best_val_loss = float('inf')
 
     with open(log_file, 'w') as f:

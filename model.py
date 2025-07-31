@@ -50,16 +50,16 @@ class ResidualBlock(nn.Module):
     def __init__(self, in_channels, out_channels, stride=1):
         super(ResidualBlock, self).__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(out_channels)  # 添加BatchNorm
+        self.bn1 = nn.BatchNorm2d(out_channels)
         self.relu = nn.ReLU(inplace=True)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_channels)  # 添加BatchNorm
+        self.bn2 = nn.BatchNorm2d(out_channels)
 
         self.shortcut = nn.Sequential()
         if stride != 1 or in_channels != out_channels:
             self.shortcut = nn.Sequential(
                 nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(out_channels),  # 添加BatchNorm
+                nn.BatchNorm2d(out_channels),
             )
 
     def forward(self, x):
@@ -74,38 +74,21 @@ class ResidualBlock(nn.Module):
         return out
 
 
-class EfficientSVDNet(nn.Module):
+class Model1(nn.Module):
     def __init__(self, M: int, N: int, r: int):
-        super(EfficientSVDNet, self).__init__()
+        super(Model1, self).__init__()
         self.M, self.N, self.r = M, N, r
 
         self.conv = nn.Sequential(
-            # nn.Conv2d(2, 64, 3, 1, 1),
-            # nn.BatchNorm2d(64),
-            # nn.ReLU(True),
-            #
-            # nn.Conv2d(64, 128, 3, 1, 1),
-            # nn.BatchNorm2d(128),
-            # nn.ReLU(True),
-            #
-            # nn.Conv2d(128, 64, 3, 1, 1),
-            # nn.BatchNorm2d(64),
-            # nn.ReLU(True),
 
-            nn.Conv2d(2, 32, 3, 1, 1),
-            nn.ReLU(True),
-            nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, 3, 1, 1),
-            nn.ReLU(True),
-
-            # ResidualBlock(2, 32, stride=2),
-            # ResidualBlock(32, 64, stride=1),
-            #
-            CBAM(64, reduction_ratio=4, spatial_kernel_size=3),
+            ResidualBlock(2, 16, stride=1),
+            # CBAM(32, reduction_ratio=8, spatial_kernel_size=5),
+            ResidualBlock(16, 32, stride=2),
+            CBAM(32, reduction_ratio=4, spatial_kernel_size=5),
         )
 
         self.u_proj = nn.Sequential(
-            nn.Conv2d(64, r * 2, 1),
+            nn.Conv2d(32, r * 2, 1, groups=4),
             nn.BatchNorm2d(r * 2),
             nn.Dropout(0.1),
             nn.AdaptiveAvgPool2d((M, 1)),
@@ -113,7 +96,7 @@ class EfficientSVDNet(nn.Module):
         )
 
         self.v_proj = nn.Sequential(
-            nn.Conv2d(64, r * 2, 1),
+            nn.Conv2d(32, r * 2, 1, groups=4),
             nn.BatchNorm2d(r * 2),
             nn.Dropout(0.1),
             nn.AdaptiveAvgPool2d((1, N)),
@@ -122,32 +105,58 @@ class EfficientSVDNet(nn.Module):
 
         self.s_proj = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(64, r, 1),
+            nn.Conv2d(32, r, 1),
             nn.BatchNorm2d(r),
             nn.Flatten(),
             nn.Softplus()
         )
 
-    def orthogonalize(self, matrix):
-        U, _, V = torch.linalg.svd(matrix, full_matrices=False)
-        return U @ V
+    def gram_schmidt(self, matrix: torch.Tensor) -> torch.Tensor:
+        """
+        对输入复数矩阵进行Gram-Schmidt正交化，避免inplace操作。
+        matrix: 形状为 (batch_size, M or N, r) 的复数张量
+        返回: 正交化的复数矩阵
+        """
+        batch_size, dim, r = matrix.shape
+
+        Q = torch.zeros(batch_size, dim, r, dtype=torch.complex64, device=matrix.device)
+
+        vectors = [matrix[:, :, 0]]
+
+        for i in range(r):
+            q = matrix[:, :, i].clone()
+            for j in range(i):
+                q_j = vectors[j]
+                proj = torch.sum(q * q_j.conj(), dim=1, keepdim=True) / \
+                       (torch.sum(q_j * q_j.conj(), dim=1, keepdim=True) + 1e-6)
+                q = q - proj * q_j
+            norm = torch.norm(q, dim=1, keepdim=True) + 1e-6
+            q = q / norm
+            vectors.append(q)
+
+            Q = Q.index_copy_(2, torch.tensor([i], device=Q.device), q.unsqueeze(2))
+
+        return Q
+
+    # def orthogonalize(self, matrix):
+    #     U, _, V = torch.linalg.svd(matrix, full_matrices=False)
+    #     return U @ V
 
     def forward(self, H_in: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         H_real = H_in.permute(0, 3, 1, 2)
         feat = self.conv(H_real)
 
         u_out = self.u_proj(feat).squeeze(-1)
-        u_out = torch.clamp(u_out, min=-1e3, max=1e3)
+        u_out = u_out / (torch.norm(u_out, dim=-1, keepdim=True) + 1e-6)
         U = torch.view_as_complex(u_out.view(-1, self.M, self.r, 2).contiguous())
-        U = self.orthogonalize(U)
+        # U = self.orthogonalize(U)
 
         v_out = self.v_proj(feat).squeeze(-2)
-        v_out = torch.clamp(v_out, min=-1e3, max=1e3)
+        v_out = v_out / (torch.norm(v_out, dim=-1, keepdim=True) + 1e-6)
         V = torch.view_as_complex(v_out.view(-1, self.N, self.r, 2).contiguous())
-        V = self.orthogonalize(V)
+        # V = self.orthogonalize(V)
 
         S = self.s_proj(feat)
-        S = torch.clamp(S, min=1e-6, max=1e3)
         S, idx = torch.sort(S, dim=-1, descending=True)
 
         U = U.gather(2, idx.unsqueeze(1).expand(-1, self.M, -1))

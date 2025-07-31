@@ -15,6 +15,7 @@ class AugmentChannelDataset(Dataset):
                  data_path: str = None,
                  label_path: str = None,
                  cfg_path: str = None,
+                 is_augment: bool = True,
                  augment_noise_std: float = 0.005,
                  augment_noise_prob: float = 0.5,
                  augment_phase_range: float = 0.05,
@@ -60,7 +61,7 @@ class AugmentChannelDataset(Dataset):
             self.nsample, self.M, self.N = self.data_complex.shape
             self.r = -1
 
-        # 数据增强参数
+        self.is_augment = is_augment
         self.augment_noise_std = augment_noise_std
         self.augment_noise_prob = augment_noise_prob
         self.augment_phase_range = augment_phase_range
@@ -105,17 +106,22 @@ class AugmentChannelDataset(Dataset):
         if self.augment_dropout_prob > 0 and torch.rand(1).item() < self.augment_dropout_apply_prob:
             row_mask = torch.rand(self.M, device=data_complex.device) > self.augment_dropout_prob
             col_mask = torch.rand(self.N, device=data_complex.device) > self.augment_dropout_prob
-            data_complex = data_complex * row_mask.view(-1, 1) * col_mask.view(1, -1)
+            augmented_data = data_complex * row_mask.view(-1, 1) * col_mask.view(1, -1)
+            # Check matrix rank
+            rank = torch.linalg.matrix_rank(augmented_data)
+            if rank >= min(self.M, self.N) // 2:  # Ensure sufficient rank
+                data_complex = augmented_data
 
         return data_complex
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
 
         data_sample = self.data_complex[idx]
+        label_sample = self.labels_complex[idx]
 
-        data_sample = self._augment(data_sample)
+        if self.is_augment:
+            data_sample = self._augment(data_sample)
 
         data_sample = torch.view_as_real(data_sample).float()
 
-        label_sample = self.labels_complex[idx]
         return data_sample, label_sample
