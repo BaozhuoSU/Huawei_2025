@@ -4,15 +4,15 @@ from torch.utils.data import DataLoader, random_split, ConcatDataset
 from tqdm import tqdm
 import os
 import numpy as np
+from datetime import datetime
 
 from augment_dataset import AugmentChannelDataset
 from model import Model1
 from dataset import ChannelDataset, parse_cfg
 from loss import LAELoss
-from datetime import datetime
-
-from model2 import Model2
+from model2 import Model2, analytic_sigma
 from model_profiler import get_avg_flops
+from su import ae_loss
 
 DATA_DIR = "./CompetitionData1"
 best_model_path = None
@@ -21,13 +21,14 @@ log_dir = f"model/{timestamp}"
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, 'training_log.txt')
 
-# SCENARIOS = ["1", "2", "3"]
-SCENARIOS = ["1"]
+SCENARIOS = ["1", "2", "3"]
+# SCENARIOS = ["1"]
 BATCH_SIZE = 512
-LEARNING_RATE = 2e-4
-EPOCHS = 500
+LEARNING_RATE = 4.5e-3
+EPOCHS = 200
 VALIDATION_SPLIT = 0.1
-WEIGHT_DECAY = 1e-4
+WEIGHT_DECAY = LEARNING_RATE * 0.01
+IS_AUGMENT = False
 
 def build_full_dataset(scenarios):
     
@@ -39,7 +40,7 @@ def build_full_dataset(scenarios):
         data_path = os.path.join(DATA_DIR, f"Round1TrainData{s_id}.npy")
         label_path = os.path.join(DATA_DIR, f"Round1TrainLabel{s_id}.npy")
         cfg_path = os.path.join(DATA_DIR, f"Round1CfgData{s_id}.txt")
-        datasets.append(AugmentChannelDataset(data_path=data_path, label_path=label_path, cfg_path=cfg_path, is_augment=True))
+        datasets.append(AugmentChannelDataset(data_path=data_path, label_path=label_path, cfg_path=cfg_path, is_augment=IS_AUGMENT))
 
     full_dataset = ConcatDataset(datasets)
     return full_dataset, (M, N, r)
@@ -50,7 +51,8 @@ def train_full_dataset(device):
     
     val_size = int(len(full_dataset) * VALIDATION_SPLIT)
     train_size = len(full_dataset) - val_size
-    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size],
+                                              generator=torch.Generator().manual_seed(42))
     
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=True)
@@ -59,8 +61,14 @@ def train_full_dataset(device):
     # model = Model1(M=M, N=N, r=r).to(device)
     criterion = LAELoss(1, 1)
     # criterion = ApproximationErrorLoss(M, N, r).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=LEARNING_RATE, epochs=EPOCHS, steps_per_epoch=len(train_loader))
+
+    # optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    # scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=LEARNING_RATE, epochs=EPOCHS, steps_per_epoch=len(train_loader))
+    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,
+                                                           T_max=EPOCHS,
+                                                           eta_min=1e-6)
+
 
     best_val_loss = float('inf')
 
@@ -77,12 +85,13 @@ def train_full_dataset(device):
             H_in, H_label = H_in.to(device), H_label.to(device)
             
             optimizer.zero_grad()
-            U_pred, S_pred, V_pred = model(H_in)
-            loss = criterion(U_pred, S_pred, V_pred, H_label)
+            U_pred, V_pred = model(H_in)
+            S_pred = analytic_sigma(U_pred, V_pred, H_label)
+            loss = ae_loss(U_pred, S_pred, V_pred, H_label)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            scheduler.step()
+
             
             train_loss += loss.item()
         
@@ -91,10 +100,12 @@ def train_full_dataset(device):
         with torch.no_grad():
             for H_in, H_label in val_loader:
                 H_in, H_label = H_in.to(device), H_label.to(device)
-                U_pred, S_pred, V_pred = model(H_in)
-                loss = criterion(U_pred, S_pred, V_pred, H_label)
+                U_pred, V_pred = model(H_in)
+                S_pred = analytic_sigma(U_pred, V_pred, H_label)
+                loss = ae_loss(U_pred, S_pred, V_pred, H_label)
                 val_loss += loss.item()
 
+        scheduler.step()
         avg_train_loss = train_loss / len(train_loader)
         avg_val_loss = val_loss / len(val_loader)
         print(f"Epoch {epoch+1}: Train Loss : {avg_train_loss:.6f} Val Loss: {avg_val_loss:.6f}")

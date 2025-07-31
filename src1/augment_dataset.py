@@ -40,8 +40,8 @@ class AugmentChannelDataset(Dataset):
         """
 
         if data_path is not None:
-            self.data = np.load(data_path)
-            self.labels = np.load(label_path) if label_path else None
+            self.data = np.load(data_path, mmap_mode='r')
+            self.labels = np.load(label_path, mmap_mode='r') if label_path else None
         else:
             raise ValueError("Must provide data_path.")
 

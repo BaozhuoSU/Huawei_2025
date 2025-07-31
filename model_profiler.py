@@ -9,14 +9,14 @@ from torch import Tensor
 import numpy as np
 from torch.utils.data import DataLoader
 
-from dataset import parse_cfg, ChannelDataset
 from augment_dataset import AugmentChannelDataset
 from loss import LAELoss
 from model import Model1
-from model2 import Model2
+from model2 import Model2, analytic_sigma
+from su import SvdNet, ChannelSvdDataset
 
 
-def get_avg_flops(model:nn.Module, input_data:Tensor)->float:
+def get_avg_flops(model: nn.Module, input_data: Tensor) -> float:
     """
     Estimates the average FLOPs per sample for a model using PyTorch Profiler.
     
@@ -30,60 +30,74 @@ def get_avg_flops(model:nn.Module, input_data:Tensor)->float:
     Raises:
         RuntimeError: If no CUDA device is available or input batch size is 0.
     """
-    
+
     # Ensure batch dimension exists
     if input_data.dim() == 0 or input_data.size(0) == 0:
         raise RuntimeError("Input data must have a non-zero batch dimension")
-    
+
     batch_size = input_data.size(0)
-    
+
     # Evaluation mode, improved inference and freeze norm layers
     model = model.eval().cpu()
     input_data = input_data.cpu()
-    
+
     with torch.no_grad():
         with profile(
-            activities=[ProfilerActivity.CPU],
-            with_flops=True,
-            record_shapes=False
+                activities=[ProfilerActivity.CPU],
+                with_flops=True,
+                record_shapes=False
         ) as prof:
             model(input_data)
     # Calculate total FLOPs
     total_flops = sum(event.flops for event in prof.events())
     avg_flops = total_flops / batch_size
-    
+
     return avg_flops * 1e-6 / 2
 
+
 def load_model(weight_path: str, M: int, N: int, r: int) -> nn.Module:
-    model = Model1(M, N, r)
+    model = SvdNet(M, N, r)
     state_dict = torch.load(weight_path, map_location="cuda" if torch.cuda.is_available() else "cpu")
     model.load_state_dict(state_dict)
     return model
 
-def process_and_export(model: nn.Module, input_tensor: Tensor, output_path: str, file_index: int, device: str = 'cuda') -> None:
+
+def process_and_export(model: nn.Module, data_loader: DataLoader, output_path: str, file_index: int,
+                       device: str = 'cuda') -> None:
     model.eval()
 
-    input_tensor = input_tensor.to(device, non_blocking=True)
-
+    U_list, S_list, V_list = [], [], []
     with torch.no_grad():
-        U, S, V = model(input_tensor)
+        for data in data_loader:
+            data = data.to(device)
+            U_pred, V_pred = model(data)
 
-    U = U.cpu().numpy()
-    V = V.cpu().numpy()
-    S = S.cpu().numpy()
+            data = data.permute(0, 2, 3, 1).contiguous()
+            data_complex = torch.view_as_complex(data)
+            S_pred = analytic_sigma(U_pred, V_pred, data_complex).to(device)
 
-    U = np.stack([U.real, U.imag], axis=-1)
-    V = np.stack([V.real, V.imag], axis=-1)
-    print(f"U shape: {U.shape}, S shape: {S.shape}, V shape: {V.shape}")
+            U_list.append(U_pred.cpu().numpy())
+            S_list.append(S_pred.cpu().numpy())
+            V_list.append(V_pred.cpu().numpy())
 
-    C = get_avg_flops(model, input_tensor)
+    U_arr = np.concatenate(U_list, axis=0)  # (Ns, M, r)
+    S_out = np.concatenate(S_list, axis=0)  # (Ns, r)
+    V_arr = np.concatenate(V_list, axis=0)  # (Ns, N, r)
+
+    # real/imag 扩到最后一维 Q=2
+    U_out = np.stack([U_arr.real, U_arr.imag], axis=-1)  # (Ns, M, r, 2)
+    V_out = np.stack([V_arr.real, V_arr.imag], axis=-1)  # (Ns, N, r, 2)
+    print(f"U shape: {U_out.shape}, S shape: {S_out.shape}, V shape: {V_out.shape}")
+
+    dummy = torch.randn(1, 2, M, N).to(device)
+    C = get_avg_flops(model, dummy)
     print(f"Average FLOPs for file {file_index}: {C:.4f} M")
 
     np.savez(
         os.path.join(output_path, f"{file_index}.npz"),
-        U=U,
-        S=S,
-        V=V,
+        U=U_out,
+        S=S_out,
+        V=V_out,
         C=float(C)
     )
 
@@ -99,8 +113,12 @@ def validate_model(model: nn.Module, data_loader: DataLoader, device: str, loss_
             data = data.to(device)
             labels = labels.to(device)
 
-            U_pred, S_pred, V_pred = model(data)
+            U_pred, V_pred = model(data)
             H_label = labels
+
+            data = data.permute(0, 2, 3, 1).contiguous()
+            data_complex = torch.view_as_complex(data)
+            S_pred = analytic_sigma(U_pred, V_pred, data_complex).to(device)
 
             loss = loss_fn(U_pred, S_pred, V_pred, H_label)
 
@@ -112,10 +130,11 @@ def validate_model(model: nn.Module, data_loader: DataLoader, device: str, loss_
     print(f"Validation Loss: {mean_loss:.4f}")
     return mean_loss
 
+
 if __name__ == "__main__":
     DATA_DIR = './CompetitionData1'
-    MODEL_PATH = './model/model_epoch_1.pth'
-    # MODEL_PATH = './svd_approximator.pth'
+    # MODEL_PATH = './model/model_epoch_422.pth'
+    MODEL_PATH = './svd_best_multi.pth'
     OUTPUT_DIR = './outputs'
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -129,23 +148,29 @@ if __name__ == "__main__":
         data_path = os.path.join(DATA_DIR, f'Round1TrainData{idx}.npy')
         label_path = os.path.join(DATA_DIR, f'Round1TrainLabel{idx}.npy')
 
-        dataset = AugmentChannelDataset(
+        train_dataset = ChannelSvdDataset(
             data_path=data_path,
-            label_path=label_path,
-            cfg_path=None,
-            is_augment=False
+            label_path=label_path
         )
-        dataloader = DataLoader(
-            dataset,
+        train_dataloader = DataLoader(
+            train_dataset,
             batch_size=512,
             shuffle=False,
             num_workers=0,
             pin_memory=True
         )
-        mean_loss = validate_model(model, dataloader, DEVICE, loss_fn)
+        mean_loss = validate_model(model, train_dataloader, DEVICE, loss_fn)
 
-        npy_path = os.path.join(DATA_DIR, f'Round1TestData{idx}.npy')
-        input_array = np.load(npy_path)
-        input_tensor = torch.tensor(input_array, dtype=torch.float32)
+        test_path = os.path.join(DATA_DIR, f'Round1TestData{idx}.npy')
+        test_dataset = ChannelSvdDataset(
+            data_path=test_path,
+        )
+        test_dataloader = DataLoader(
+            test_dataset,
+            batch_size=512,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=True
+        )
 
-        process_and_export(model, input_tensor, OUTPUT_DIR, idx)
+        process_and_export(model, test_dataloader, OUTPUT_DIR, idx)
