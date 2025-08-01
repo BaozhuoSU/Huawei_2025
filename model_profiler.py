@@ -9,11 +9,7 @@ from torch import Tensor
 import numpy as np
 from torch.utils.data import DataLoader
 
-from augment_dataset import AugmentChannelDataset
-from loss import LAELoss
-from model import Model1
-from model2 import Model2, analytic_sigma
-from su import SvdNet, ChannelSvdDataset
+from su import SvdNet, ChannelSvdDataset, ae_loss, analytic_sigma
 
 
 def get_avg_flops(model: nn.Module, input_data: Tensor) -> float:
@@ -102,7 +98,7 @@ def process_and_export(model: nn.Module, data_loader: DataLoader, output_path: s
     )
 
 
-def validate_model(model: nn.Module, data_loader: DataLoader, device: str, loss_fn: nn.Module) -> float:
+def validate_model(model: nn.Module, data_loader: DataLoader, device: str) -> float:
     model.eval()
     model.to(device)
     total_loss = 0.0
@@ -120,7 +116,7 @@ def validate_model(model: nn.Module, data_loader: DataLoader, device: str, loss_
             data_complex = torch.view_as_complex(data)
             S_pred = analytic_sigma(U_pred, V_pred, data_complex).to(device)
 
-            loss = loss_fn(U_pred, S_pred, V_pred, H_label)
+            loss = ae_loss(U_pred, S_pred, V_pred, H_label)
 
             total_loss += loss.item() * data.size(0)
             num_samples += data.size(0)
@@ -140,7 +136,6 @@ if __name__ == "__main__":
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     M, N, r = 64, 64, 32
-    loss_fn = LAELoss(recon_weight=1, ortho_weight=0.1).to(DEVICE)
 
     model = load_model(MODEL_PATH, M, N, r)
 
@@ -159,7 +154,7 @@ if __name__ == "__main__":
             num_workers=0,
             pin_memory=True
         )
-        mean_loss = validate_model(model, train_dataloader, DEVICE, loss_fn)
+        mean_loss = validate_model(model, train_dataloader, DEVICE)
 
         test_path = os.path.join(DATA_DIR, f'Round1TestData{idx}.npy')
         test_dataset = ChannelSvdDataset(
