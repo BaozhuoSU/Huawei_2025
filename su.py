@@ -39,7 +39,14 @@ class ChannelSvdDataset(Dataset):
         return self.X.shape[0]
 
     def __getitem__(self, idx):
-        x = torch.from_numpy(self.X[idx]).float()  # (2, M, N)
+        # x = torch.from_numpy(self.X[idx]).float()  # (2, M, N)
+
+        x_numpy = self.X[idx] # (2, M, N)
+        h_complex = torch.complex(torch.from_numpy(x_numpy[0]), torch.from_numpy(x_numpy[1]))
+        fro_norm = torch.linalg.norm(h_complex, ord='fro') + 1e-8
+        h_normalized = h_complex / fro_norm
+        x = torch.stack([h_normalized.real, h_normalized.imag], dim=0).float()
+
         if self.H is not None:
             h = self.H[idx]  # complex64 (M, N)
             return x, torch.from_numpy(h)
@@ -115,6 +122,7 @@ class DepthwiseSeparableConv(nn.Module):
         out = self.bn(out)
         return self.relu(out)
 
+
 class SvdNet(nn.Module):
     def __init__(self, M=64, N=64, r=32):
         super().__init__()
@@ -152,15 +160,10 @@ class SvdNet(nn.Module):
             nn.BatchNorm2d(16),
             nn.ReLU(),
 
-            # Block 1: 32x32 -> 16x16
             DepthwiseSeparableConv(16, 32, stride=2),
             CBAM(32),
-
-            # Block 2: 16x16 -> 8x8
             DepthwiseSeparableConv(32, 64, stride=2),
             CBAM(64),
-
-            # Block 3: 8x8 -> 8x8
             DepthwiseSeparableConv(64, 128, stride=1),
             CBAM(128),
 
@@ -229,11 +232,18 @@ def ae_loss(U, S, V, H, lam=1.0):
     err_v = torch.linalg.norm(VV - I_r, ord='fro', dim=(1, 2))
     return (recon + lam * (err_u + err_v)).mean()
 
+def load_model(weight_path: str, M: int, N: int, r: int) -> nn.Module:
+    model = SvdNet(M, N, r)
+    state_dict = torch.load(weight_path, map_location="cuda" if torch.cuda.is_available() else "cpu")
+    model.load_state_dict(state_dict)
+    return model
+
 
 # =============================================================
 # 主函数：加载 data2/data3/data4，训练 & 验证
 # =============================================================
-def main():
+def main(weight_path=None):
+
     # 1) 准备数据集
     # ROOTS = [Path.cwd() / f"data{i}" for i in (1, 2, 3)]
     root = "./CompetitionData1"
@@ -259,7 +269,13 @@ def main():
     # 2) 模型 & 优化器 & LR Scheduler
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     M, Nmat, r = train_sets[0].M, train_sets[0].N, 32
-    model = SvdNet(M, Nmat, r).to(device)
+
+    if weight_path:
+        print(f"Loading model weights from {weight_path}")
+        model = load_model(weight_path, M, Nmat, r).to(device)
+    else:
+        print("Initializing new model")
+        model = SvdNet(M, Nmat, r).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,
                                                            T_max=NUM_EPOCHS,
@@ -326,11 +342,12 @@ def main():
     print(f"Training complete, best val_loss = {best_loss:.4f}")
 
 
-NUM_EPOCHS = 150
+NUM_EPOCHS = 300
 LEARNING_RATE = 3e-4
 BATCH_SIZE = 64
 timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 LOG_DIR = f"model/{timestamp}"
 
 if __name__ == "__main__":
-    main()
+    model_path = "./svd_best_multi.pth"
+    main(model_path)

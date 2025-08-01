@@ -114,7 +114,7 @@ def validate_model(model: nn.Module, data_loader: DataLoader, device: str) -> fl
 
             data = data.permute(0, 2, 3, 1).contiguous()
             data_complex = torch.view_as_complex(data)
-            S_pred = analytic_sigma(U_pred, V_pred, data_complex).to(device)
+            S_pred = analytic_sigma(U_pred, V_pred, H_label).to(device)
 
             loss = ae_loss(U_pred, S_pred, V_pred, H_label)
 
