@@ -54,7 +54,7 @@ def get_avg_flops(model: nn.Module, input_data: Tensor) -> float:
 def load_model(weight_path: str, M: int, N: int, r: int) -> nn.Module:
     model = SvdNet(M, N, r)
     state_dict = torch.load(weight_path, map_location="cuda" if torch.cuda.is_available() else "cpu")
-    print(f"device: {torch.cuda.current_device() if torch.cuda.is_available() else 'cpu'}")
+    print(f"device: {DEVICE}")
     model.load_state_dict(state_dict)
     return model
 

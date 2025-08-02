@@ -150,36 +150,60 @@ class DepthwiseSeparableConv(nn.Module):
         return self.relu(out)
 
 
+class ConvDecoderHead(nn.Module):
+    """
+    一个卷积解码头，用于从编码器的特征图生成U和V矩阵。
+    它将 (B, C, H, W) 的特征图转换为 (B, M, r) 和 (B, N, r) 的复数矩阵。
+    """
+
+    def __init__(self, in_channels, M, N, r):
+        super().__init__()
+        self.M, self.N, self.r = M, N, r
+
+        # 输入特征图的高度和宽度必须相乘等于 M 和 N
+        self.sequence_len = M  # 假设 M == N
+
+        # 定义1D卷积层。我们将用它来转换特征通道。
+        self.conv_block = nn.Sequential(
+            # 使用一个中间层来增加非线性能力
+            nn.Conv1d(in_channels, in_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm1d(in_channels),
+            nn.ReLU(),
+            # 最后的1x1卷积用于将通道数映射到目标数量 2*r
+            nn.Conv1d(in_channels, 2 * r, kernel_size=1)
+        )
+
+    def forward(self, x):
+        # x 的输入形状: (B, C, H, W), e.g., (B, 128, 8, 8)
+        B = x.shape[0]
+
+        # 1. 将2D特征图重塑为1D序列
+        # (B, C, H, W) -> (B, C, H*W) = (B, 128, 64)
+        x_seq = x.view(B, -1, self.sequence_len)
+
+        # 2. 通过1D卷积块进行处理
+        # (B, 128, 64) -> (B, 2*r, 64)
+        processed_seq = self.conv_block(x_seq)
+
+        # 3. 调整形状以匹配 (B, M, r) 和 (B, N, r)
+        # (B, 2*r, M) -> (B, M, 2*r)
+        y = processed_seq.permute(0, 2, 1)
+
+        # 4. 将最后一个维度拆分为 r 和 2 (实部和虚部)
+        # (B, M, 2*r) -> (B, M, r, 2)
+        y = y.view(B, self.M, self.r, 2)
+
+        y_complex = torch.complex(y[..., 0], y[..., 1])  # 形状: (B, M, r)
+
+        U = y_complex
+        V = y_complex.clone()
+
+        return U, V
+
 class SvdNet(nn.Module):
     def __init__(self, M=64, N=64, r=32):
         super().__init__()
         self.M, self.N, self.r = M, N, r
-        # encoder backbone
-        # self.enc = nn.Sequential(
-        #     nn.Conv2d(2, 8, 3, 1, 1),
-        #     nn.ELU(),
-        #     # ResidualBlock(8),
-        #     CBAM(8),
-        #
-        #     nn.Conv2d(8,16, 3, 1, 1),
-        #     nn.ELU(),
-        #     # ResidualBlock(16),
-        #     CBAM(16),
-        #
-        #     nn.MaxPool2d(2),
-        #     nn.AdaptiveAvgPool2d(1),
-        #     nn.Flatten()
-        # )
-        #
-        # # predictor FC: [U_real, U_imag, V_real, V_imag]
-        # self.fc = nn.Sequential(
-        #     nn.Linear(16, 32),
-        #     nn.ELU(),
-        #     nn.Linear(32, 2*M*r + 2*N*r)
-        # )
-        # # 初始化 Σ bias>0 （前 r 个偏置位置）
-        # with torch.no_grad():
-        #     self.fc[-1].bias[:r].fill_(0.5)
 
         self.enc = nn.Sequential(
             FourierFeatureBlock(1, h=64, w=64), # 2 channels = 1 complex pairs
@@ -187,13 +211,6 @@ class SvdNet(nn.Module):
             nn.Conv2d(2, 16, kernel_size=3, padding=1, stride=2, bias=False),
             nn.BatchNorm2d(16),
             nn.ReLU(),
-
-            # DepthwiseSeparableConv(16, 32, stride=2),
-            # CBAM(32),
-            # DepthwiseSeparableConv(32, 64, stride=2),
-            # CBAM(64),
-            # DepthwiseSeparableConv(64, 128, stride=1),
-            # CBAM(128),
 
             FourierFeatureBlock(8, h=32, w=32),  # 16 channels = 8 complex pairs
             CBAM(16),
@@ -210,35 +227,40 @@ class SvdNet(nn.Module):
             CBAM(128),
 
             # 全局平均池化
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten()
+            # nn.AdaptiveAvgPool2d(1),
+            # nn.Flatten()
         )
 
         fc_input_size = 128
         output_size = 2 * M * r + 2 * N * r
-        self.fc = nn.Sequential(
-            nn.Linear(fc_input_size, 512),
-            nn.ReLU(),
-            nn.Linear(512, output_size)
-        )
+        # self.fc = nn.Sequential(
+        #     nn.Linear(fc_input_size, 512),
+        #     nn.ReLU(),
+        #     nn.Linear(512, output_size)
+        # )
+        self.decoder_head = ConvDecoderHead(fc_input_size, M, N, r)
+
 
     def forward(self, x):
         # x: (B,2,M,N)
         B = x.size(0)
-        y = self.fc(self.enc(x))  # (B, 2*M*r + 2*N*r)
-        p = 0
-        U_r = y[:, p:p + self.M * self.r].reshape(B, self.M, self.r)
-        p += self.M * self.r
-        U_i = y[:, p:p + self.M * self.r].reshape(B, self.M, self.r)
-        p += self.M * self.r
-        V_r = y[:, p:p + self.N * self.r].reshape(B, self.N, self.r)
-        p += self.N * self.r
-        V_i = y[:, p:p + self.N * self.r].reshape(B, self.N, self.r)
+        fea = self.enc(x)
 
-        U = torch.complex(U_r, U_i)  # (B, M, r)
-        V = torch.complex(V_r, V_i)  # (B, N, r)
-        U = qr_orthonormalize(U)
-        V = qr_orthonormalize(V)
+        # y = self.fc(fea)  # (B, 2*M*r + 2*N*r)
+        # p = 0
+        # U_r = y[:, p:p + self.M * self.r].reshape(B, self.M, self.r)
+        # p += self.M * self.r
+        # U_i = y[:, p:p + self.M * self.r].reshape(B, self.M, self.r)
+        # p += self.M * self.r
+        # V_r = y[:, p:p + self.N * self.r].reshape(B, self.N, self.r)
+        # p += self.N * self.r
+        # V_i = y[:, p:p + self.N * self.r].reshape(B, self.N, self.r)
+        # U = torch.complex(U_r, U_i)  # (B, M, r)
+        # V = torch.complex(V_r, V_i)  # (B, N, r)
+        U_raw, V_raw = self.decoder_head(fea)
+
+        U = qr_orthonormalize(U_raw)
+        V = qr_orthonormalize(V_raw)
         return U, V
 
 
