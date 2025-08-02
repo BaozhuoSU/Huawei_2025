@@ -149,56 +149,112 @@ class DepthwiseSeparableConv(nn.Module):
         out = self.bn(out)
         return self.relu(out)
 
+class GatedConv1d(nn.Module):
+    """
+    实现门控线性单元 (GLU) 的一维卷积模块。
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, padding):
+        super().__init__()
+        self.conv_data = nn.Conv1d(in_channels, out_channels, kernel_size, padding=padding)
+        self.conv_gate = nn.Conv1d(in_channels, out_channels, kernel_size, padding=padding)
+
+    def forward(self, x):
+        # 计算数据通路和门控通路
+        data = self.conv_data(x)
+        gate = torch.sigmoid(self.conv_gate(x))
+        # 逐元素相乘
+        return data * gate
 
 class ConvDecoderHead(nn.Module):
-    """
-    一个卷积解码头，用于从编码器的特征图生成U和V矩阵。
-    它将 (B, C, H, W) 的特征图转换为 (B, M, r) 和 (B, N, r) 的复数矩阵。
-    """
-
-    def __init__(self, in_channels, M, N, r):
+    def __init__(self, in_channels, M, N, r, dropout_rate=0.1):
         super().__init__()
         self.M, self.N, self.r = M, N, r
 
-        # 输入特征图的高度和宽度必须相乘等于 M 和 N
-        self.sequence_len = M  # 假设 M == N
-
-        # 定义1D卷积层。我们将用它来转换特征通道。
-        self.conv_block = nn.Sequential(
-            # 使用一个中间层来增加非线性能力
-            nn.Conv1d(in_channels, in_channels, kernel_size=3, padding=1, bias=False),
+        # 使用GLU增强的卷积模块
+        self.gated_conv_block = nn.Sequential(
+            GatedConv1d(in_channels, in_channels, kernel_size=3, padding=1),
             nn.BatchNorm1d(in_channels),
-            nn.ReLU(),
-            # 最后的1x1卷积用于将通道数映射到目标数量 2*r
-            nn.Conv1d(in_channels, 2 * r, kernel_size=1)
+            nn.Dropout(dropout_rate),
+            # 最后的1x1卷积用于映射到最终维度
+            nn.Conv1d(in_channels, 4 * r, kernel_size=1)
         )
 
     def forward(self, x):
-        # x 的输入形状: (B, C, H, W), e.g., (B, 128, 8, 8)
-        B = x.shape[0]
+        # 这部分逻辑和 UnifiedConvDecoderHead 完全相同
+        B, C, H, W = x.shape
+        sequence_len = H * W
+        x_seq = x.view(B, C, sequence_len)
 
-        # 1. 将2D特征图重塑为1D序列
-        # (B, C, H, W) -> (B, C, H*W) = (B, 128, 64)
-        x_seq = x.view(B, -1, self.sequence_len)
+        # 使用增强的卷积块
+        processed_seq = self.gated_conv_block(x_seq)
 
-        # 2. 通过1D卷积块进行处理
-        # (B, 128, 64) -> (B, 2*r, 64)
-        processed_seq = self.conv_block(x_seq)
-
-        # 3. 调整形状以匹配 (B, M, r) 和 (B, N, r)
-        # (B, 2*r, M) -> (B, M, 2*r)
         y = processed_seq.permute(0, 2, 1)
+        y_u_raw, y_v_raw = torch.split(y, [2 * self.r, 2 * self.r], dim=-1)
 
-        # 4. 将最后一个维度拆分为 r 和 2 (实部和虚部)
-        # (B, M, 2*r) -> (B, M, r, 2)
-        y = y.view(B, self.M, self.r, 2)
+        u = y_u_raw.view(B, self.M, self.r, 2)
+        U_complex = torch.complex(u[..., 0], u[..., 1])
 
-        y_complex = torch.complex(y[..., 0], y[..., 1])  # 形状: (B, M, r)
+        v = y_v_raw.view(B, self.N, self.r, 2)
+        V_complex = torch.complex(v[..., 0], v[..., 1])
 
-        U = y_complex
-        V = y_complex.clone()
+        return U_complex, V_complex
 
-        return U, V
+# class AttentionCouplingModule(nn.Module):
+#     """
+#     使用交叉注意力来耦合 U 和 V 的表征。
+#     它接收 U 和 V 的初始表征，并通过让它们相互关注来对其进行迭代优化。
+#     """
+#     def __init__(self, embed_dim, num_heads, num_layers=2, dropout_rate=0.1):
+#         super().__init__()
+#         self.num_layers = num_layers
+#         self.layers = nn.ModuleList([])
+#         for _ in range(num_layers):
+#             self.layers.append(nn.ModuleList([
+#                 # U attends to V
+#                 nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout_rate, batch_first=True),
+#                 # V attends to U
+#                 nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout_rate, batch_first=True),
+#                 nn.LayerNorm(embed_dim),
+#                 nn.LayerNorm(embed_dim),
+#                 nn.Sequential(nn.Linear(embed_dim, 4 * embed_dim), nn.ReLU(), nn.Linear(4 * embed_dim, embed_dim)),
+#                 nn.Sequential(nn.Linear(embed_dim, 4 * embed_dim), nn.ReLU(), nn.Linear(4 * embed_dim, embed_dim)),
+#                 nn.Dropout(dropout_rate),
+#                 nn.Dropout(dropout_rate)
+#             ]))
+#     def forward(self, u, v):
+#         """
+#         u: (B, M, r) - M是序列长度, r是特征维度(embed_dim)
+#         v: (B, N, r) - N是序列长度, r是特征维度(embed_dim)
+#         """
+#         # 为了处理复数，我们将实部和虚部叠加在特征维度上
+#         u_real, u_imag = u.real, u.imag
+#         v_real, v_imag = v.real, v.imag
+#
+#         # 将复数转换为 (B, Seq, 2*r) 的实数张量以输入注意力模块
+#         u_rep = torch.cat([u_real, u_imag], dim=-1)
+#         v_rep = torch.cat([v_real, v_imag], dim=-1)
+#
+#         for u_attend_v, v_attend_u, norm_u, norm_v, ffn_u, ffn_v, drop_u, drop_v in self.layers:
+#             # U 从 V 中获取信息
+#             u_updated, _ = u_attend_v(query=u_rep, key=v_rep, value=v_rep)
+#             u_rep = norm_u(u_rep + drop_u(u_updated))  # Add & Norm
+#             u_rep = norm_u(u_rep + drop_u(ffn_u(u_rep)))  # FFN
+#
+#             # V 从 U 中获取信息
+#             v_updated, _ = v_attend_u(query=v_rep, key=u_rep, value=u_rep)
+#             v_rep = norm_v(v_rep + drop_v(v_updated))  # Add & Norm
+#             v_rep = norm_v(v_rep + drop_v(ffn_v(v_rep)))  # FFN
+#
+#         # 将 (B, Seq, 2*r) 的表征转换回 (B, Seq, r) 的复数张量
+#         r = u.shape[-1]
+#         u_final_real, u_final_imag = u_rep.split(r, dim=-1)
+#         v_final_real, v_final_imag = v_rep.split(r, dim=-1)
+#
+#         u_final = torch.complex(u_final_real, u_final_imag)
+#         v_final = torch.complex(v_final_real, v_final_imag)
+#
+#         return u_final, v_final
+
 
 class SvdNet(nn.Module):
     def __init__(self, M=64, N=64, r=32):
@@ -226,41 +282,27 @@ class SvdNet(nn.Module):
             DepthwiseSeparableConv(64, 128, stride=1),
             CBAM(128),
 
-            # 全局平均池化
-            # nn.AdaptiveAvgPool2d(1),
-            # nn.Flatten()
         )
 
         fc_input_size = 128
-        output_size = 2 * M * r + 2 * N * r
-        # self.fc = nn.Sequential(
-        #     nn.Linear(fc_input_size, 512),
-        #     nn.ReLU(),
-        #     nn.Linear(512, output_size)
-        # )
-        self.decoder_head = ConvDecoderHead(fc_input_size, M, N, r)
+        num_attn_heads = 4
+        num_coupling_layers = 2
 
+        self.decoder_head = ConvDecoderHead(fc_input_size, M, N, r)
+        # self.coupling_module = AttentionCouplingModule(embed_dim=2 * r, num_heads=num_attn_heads,
+        #                                                num_layers=num_coupling_layers)
+        # self.coupling_module = LightweightCouplingModule(embed_dim=2 * r)
 
     def forward(self, x):
-        # x: (B,2,M,N)
-        B = x.size(0)
         fea = self.enc(x)
 
-        # y = self.fc(fea)  # (B, 2*M*r + 2*N*r)
-        # p = 0
-        # U_r = y[:, p:p + self.M * self.r].reshape(B, self.M, self.r)
-        # p += self.M * self.r
-        # U_i = y[:, p:p + self.M * self.r].reshape(B, self.M, self.r)
-        # p += self.M * self.r
-        # V_r = y[:, p:p + self.N * self.r].reshape(B, self.N, self.r)
-        # p += self.N * self.r
-        # V_i = y[:, p:p + self.N * self.r].reshape(B, self.N, self.r)
-        # U = torch.complex(U_r, U_i)  # (B, M, r)
-        # V = torch.complex(V_r, V_i)  # (B, N, r)
-        U_raw, V_raw = self.decoder_head(fea)
+        # U = self.u_head(fea)
+        # V = self.v_head(fea)
+        U, V = self.decoder_head(fea)
+        # U, V = self.coupling_module(U, V)
 
-        U = qr_orthonormalize(U_raw)
-        V = qr_orthonormalize(V_raw)
+        U = qr_orthonormalize(U)
+        V = qr_orthonormalize(V)
         return U, V
 
 
@@ -415,6 +457,6 @@ timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 LOG_DIR = f"model/{timestamp}"
 
 if __name__ == "__main__":
-    # model_path = "./svd_best_multi.pth"
+    # model_path = "./0.3230.pth"
     model_path = None
     main(model_path)
