@@ -39,17 +39,19 @@ class ChannelSvdDataset(Dataset):
         return self.X.shape[0]
 
     def __getitem__(self, idx):
-        # x = torch.from_numpy(self.X[idx]).float()  # (2, M, N)
-
-        x_numpy = self.X[idx] # (2, M, N)
-        h_complex = torch.complex(torch.from_numpy(x_numpy[0]), torch.from_numpy(x_numpy[1]))
-        fro_norm = torch.linalg.norm(h_complex, ord='fro') + 1e-8
-        h_normalized = h_complex / fro_norm
-        x = torch.stack([h_normalized.real, h_normalized.imag], dim=0).float()
+        x = torch.from_numpy(self.X[idx]).float()  # (2, M, N)
+        # x_numpy = self.X[idx] # (2, M, N)
+        # x_complex = torch.complex(torch.from_numpy(x_numpy[0]), torch.from_numpy(x_numpy[1]))
+        # fro_norm = torch.linalg.norm(x_complex, ord='fro') + 1e-8
+        # x_normalized = x_complex / fro_norm
+        # x = torch.stack([x_normalized.real, x_normalized.imag], dim=0).float()
 
         if self.H is not None:
             h = self.H[idx]  # complex64 (M, N)
-            return x, torch.from_numpy(h)
+            h = torch.from_numpy(h)
+            # h_fro_norm = torch.linalg.norm(h, ord='fro') + 1e-8
+            # h_normalized = h / h_fro_norm
+            return x, h
         else:
             return x
 
@@ -58,20 +60,43 @@ class ChannelSvdDataset(Dataset):
 # 定义：SvdNet 模型
 # ———— 轻量级 Conv→GAP→FC → 输出 U, V
 # =============================================================
+def qr_orthonormalize(x_raw):
+    """
+    使用 QR 分解来使矩阵列正交。
+    x_raw: 神经网络输出的原始矩阵, shape (B, M, r)
+    """
+    # mode='reduced' 会返回一个 (M, r) 的 Q 矩阵
+    Q, _ = torch.linalg.qr(x_raw, mode='reduced')
+    return Q
 
-class ResidualBlock(nn.Module):
-    def __init__(self, channels):
+
+class FourierFeatureBlock(nn.Module):
+    def __init__(self, in_channels, h, w):
         super().__init__()
-        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1)
-        self.elu = nn.ELU()
-        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1)
+
+        self.weights = nn.Parameter(torch.randn(in_channels, h, w, dtype=torch.cfloat))
+
+        self.alpha = nn.Parameter(torch.zeros(1))
 
     def forward(self, x):
-        identity = x
-        out = self.elu(self.conv1(x))
-        out = self.conv2(out)
-        out = out + identity
-        return self.elu(out)
+        # This logic for creating a complex tensor is correct and stays the same
+        if x.shape[1] == 2:
+            x_complex = torch.complex(x[:, 0, :, :], x[:, 1, :, :]).unsqueeze(1)
+        else:
+            b, c, h, w = x.shape
+            x_complex = torch.complex(x[:, 0:c:2, :, :], x[:, 1:c:2, :, :])
+
+        x_fft = torch.fft.fft2(x_complex, norm='ortho')
+        x_filtered = torch.einsum("bchw,chw->bchw", x_fft, self.weights)
+        x_ifft = torch.fft.ifft2(x_filtered, s=(x_complex.shape[-2], x_complex.shape[-1]), norm='ortho')
+
+        x_out_real = x_ifft.real
+        x_out_imag = x_ifft.imag
+        x_out = torch.cat([x_out_real, x_out_imag], dim=1)
+
+        # The residual connection is correct and stays the same
+        return x + self.alpha * x_out
+
 
 class CBAM(nn.Module):
     def __init__(self, channels, reduction=4, kernel_size=7):
@@ -108,10 +133,12 @@ class CBAM(nn.Module):
 
         return x
 
+
 class DepthwiseSeparableConv(nn.Module):
     def __init__(self, in_channels, out_channels, stride=1):
         super().__init__()
-        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, stride=stride, groups=in_channels, bias=False)
+        self.depthwise = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, stride=stride,
+                                   groups=in_channels, bias=False)
         self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
         self.bn = nn.BatchNorm2d(out_channels)
         self.relu = nn.ReLU()
@@ -155,15 +182,30 @@ class SvdNet(nn.Module):
         #     self.fc[-1].bias[:r].fill_(0.5)
 
         self.enc = nn.Sequential(
-            # 初始层: 64x64 -> 32x32
+            FourierFeatureBlock(1, h=64, w=64), # 2 channels = 1 complex pairs
+            # (2, 64, 64) -> (16, 32, 32)
             nn.Conv2d(2, 16, kernel_size=3, padding=1, stride=2, bias=False),
             nn.BatchNorm2d(16),
             nn.ReLU(),
 
+            # DepthwiseSeparableConv(16, 32, stride=2),
+            # CBAM(32),
+            # DepthwiseSeparableConv(32, 64, stride=2),
+            # CBAM(64),
+            # DepthwiseSeparableConv(64, 128, stride=1),
+            # CBAM(128),
+
+            FourierFeatureBlock(8, h=32, w=32),  # 16 channels = 8 complex pairs
+            CBAM(16),
+            # (16, 32, 32) -> (32, 16, 16)
             DepthwiseSeparableConv(16, 32, stride=2),
+            FourierFeatureBlock(16, h=16, w=16),  # 32 channels = 16 complex pairs
             CBAM(32),
+            # (32, 16, 16) -> (64, 8, 8)
             DepthwiseSeparableConv(32, 64, stride=2),
+            FourierFeatureBlock(32, h=8, w=8),  # 64 channels = 32 complex pairs
             CBAM(64),
+            # (64, 8, 8) -> (128, 8, 8)
             DepthwiseSeparableConv(64, 128, stride=1),
             CBAM(128),
 
@@ -172,7 +214,6 @@ class SvdNet(nn.Module):
             nn.Flatten()
         )
 
-        # 轻量级的 Predictor FC (保持不变)
         fc_input_size = 128
         output_size = 2 * M * r + 2 * N * r
         self.fc = nn.Sequential(
@@ -196,6 +237,8 @@ class SvdNet(nn.Module):
 
         U = torch.complex(U_r, U_i)  # (B, M, r)
         V = torch.complex(V_r, V_i)  # (B, N, r)
+        U = qr_orthonormalize(U)
+        V = qr_orthonormalize(V)
         return U, V
 
 
@@ -211,6 +254,7 @@ def analytic_sigma(U, V, H):
 
     S = torch.clamp(raw_S, min=0.0)
     return S  # (B, r)
+
 
 def ae_loss(U, S, V, H, lam=1.0):
     B = H.size(0)
@@ -232,6 +276,7 @@ def ae_loss(U, S, V, H, lam=1.0):
     err_v = torch.linalg.norm(VV - I_r, ord='fro', dim=(1, 2))
     return (recon + lam * (err_u + err_v)).mean()
 
+
 def load_model(weight_path: str, M: int, N: int, r: int) -> nn.Module:
     model = SvdNet(M, N, r)
     state_dict = torch.load(weight_path, map_location="cuda" if torch.cuda.is_available() else "cpu")
@@ -243,7 +288,6 @@ def load_model(weight_path: str, M: int, N: int, r: int) -> nn.Module:
 # 主函数：加载 data2/data3/data4，训练 & 验证
 # =============================================================
 def main(weight_path=None):
-
     # 1) 准备数据集
     # ROOTS = [Path.cwd() / f"data{i}" for i in (1, 2, 3)]
     root = "./CompetitionData1"
@@ -263,11 +307,12 @@ def main(weight_path=None):
         full_ds, [n_train, n_val],
         generator=torch.Generator().manual_seed(42)
     )
-    train_loader = DataLoader(train_ds, batch_size=64, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_ds, batch_size=64, shuffle=False, num_workers=0)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
     # 2) 模型 & 优化器 & LR Scheduler
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"device: {device}")
     M, Nmat, r = train_sets[0].M, train_sets[0].N, 32
 
     if weight_path:
@@ -288,7 +333,6 @@ def main(weight_path=None):
         f.write(
             f"Batch sizes: Train={BATCH_SIZE}\n Learning rate: {LEARNING_RATE}\n Epochs: {NUM_EPOCHS}\n")
 
-
     # 3) 训练循环
     best_loss, patience = float('inf'), 0
     for epoch in range(1, NUM_EPOCHS + 1):
@@ -299,7 +343,7 @@ def main(weight_path=None):
             x, H = x.to(device), H.to(device)
             optimizer.zero_grad()
             U, V = model(x)
-            S = analytic_sigma(U, V, H)
+            S = analytic_sigma(U, V, torch.view_as_complex(x.permute(0, 2, 3, 1).contiguous()))
             loss = ae_loss(U, S, V, H)
             loss.backward()
             optimizer.step()
@@ -318,7 +362,7 @@ def main(weight_path=None):
             for x, H in val_loader:
                 x, H = x.to(device), H.to(device)
                 U, V = model(x)
-                S = analytic_sigma(U, V, H)
+                S = analytic_sigma(U, V, torch.view_as_complex(x.permute(0, 2, 3, 1).contiguous()))
                 l = ae_loss(U, S, V, H)
                 b = x.size(0)
                 v_sum += l.item() * b
@@ -332,22 +376,23 @@ def main(weight_path=None):
         # 保存最优
         if val_loss < best_loss:
             best_loss, patience = val_loss, 0
-            torch.save(model.state_dict(), os.path.join(LOG_DIR,'svd_best_multi.pth'))
+            torch.save(model.state_dict(), os.path.join(LOG_DIR, 'svd_best_multi.pth'))
             print("  → saved new best weights")
 
         with open(log_file, 'a') as f:
             f.write(
-                f"Epoch {epoch+1}: Train Loss : {train_loss:.6f} Val Loss: {val_loss:.6f}\n")
+                f"Epoch {epoch + 1}: Train Loss : {train_loss:.6f} Val Loss: {val_loss:.6f}\n")
 
     print(f"Training complete, best val_loss = {best_loss:.4f}")
 
 
-NUM_EPOCHS = 300
+NUM_EPOCHS = 500
 LEARNING_RATE = 3e-4
 BATCH_SIZE = 64
 timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 LOG_DIR = f"model/{timestamp}"
 
 if __name__ == "__main__":
-    model_path = "./svd_best_multi.pth"
+    # model_path = "./svd_best_multi.pth"
+    model_path = None
     main(model_path)

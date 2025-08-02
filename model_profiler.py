@@ -54,6 +54,7 @@ def get_avg_flops(model: nn.Module, input_data: Tensor) -> float:
 def load_model(weight_path: str, M: int, N: int, r: int) -> nn.Module:
     model = SvdNet(M, N, r)
     state_dict = torch.load(weight_path, map_location="cuda" if torch.cuda.is_available() else "cpu")
+    print(f"device: {torch.cuda.current_device() if torch.cuda.is_available() else 'cpu'}")
     model.load_state_dict(state_dict)
     return model
 
@@ -114,7 +115,7 @@ def validate_model(model: nn.Module, data_loader: DataLoader, device: str) -> fl
 
             data = data.permute(0, 2, 3, 1).contiguous()
             data_complex = torch.view_as_complex(data)
-            S_pred = analytic_sigma(U_pred, V_pred, H_label).to(device)
+            S_pred = analytic_sigma(U_pred, V_pred, data_complex).to(device)
 
             loss = ae_loss(U_pred, S_pred, V_pred, H_label)
 
