@@ -63,7 +63,7 @@ def train_full_dataset(device):
     # criterion = ApproximationErrorLoss(M, N, r).to(device)
 
     # optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=LEARNING_RATE, epochs=EPOCHS, steps_per_epoch=len(train_loader))
+    # scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=LEARNING_RATE, epochs=EPOCHS, steps_per_epoch=len(train_loader))
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,
                                                            T_max=EPOCHS,

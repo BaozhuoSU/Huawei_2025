@@ -40,20 +40,20 @@ class ChannelSvdDataset(Dataset):
 
     def __getitem__(self, idx):
         x = torch.from_numpy(self.X[idx]).float()  # (2, M, N)
-        # x_numpy = self.X[idx] # (2, M, N)
-        # x_complex = torch.complex(torch.from_numpy(x_numpy[0]), torch.from_numpy(x_numpy[1]))
-        # fro_norm = torch.linalg.norm(x_complex, ord='fro') + 1e-8
-        # x_normalized = x_complex / fro_norm
-        # x = torch.stack([x_normalized.real, x_normalized.imag], dim=0).float()
+        x_numpy = self.X[idx]  # (2, M, N)
+        x_complex = torch.complex(torch.from_numpy(x_numpy[0]), torch.from_numpy(x_numpy[1]))
+        fro_norm = torch.linalg.norm(x_complex, ord='fro') + 1e-8
+        x_normalized = x_complex / fro_norm
+        x_normalized = torch.stack([x_normalized.real, x_normalized.imag], dim=0).float()
 
         if self.H is not None:
             h = self.H[idx]  # complex64 (M, N)
             h = torch.from_numpy(h)
             # h_fro_norm = torch.linalg.norm(h, ord='fro') + 1e-8
             # h_normalized = h / h_fro_norm
-            return x, h
+            return x_normalized, h, fro_norm
         else:
-            return x
+            return x_normalized, fro_norm
 
 
 # =============================================================
@@ -68,6 +68,42 @@ def qr_orthonormalize(x_raw):
     # mode='reduced' 会返回一个 (M, r) 的 Q 矩阵
     Q, _ = torch.linalg.qr(x_raw, mode='reduced')
     return Q
+
+
+def calculate_rms_delay_spread(H_complex, sample_time=1.0):
+    """
+    计算一批MIMO信道矩阵的RMS延迟扩展。
+
+    参数:
+    H_complex (torch.Tensor): 复数信道矩阵, shape (B, M, N)。假设N是频域/子载波维度。
+    sample_time (float): 采样时间或时延单元的间隔，用于给延迟扩展一个物理尺度。默认为1.0。
+
+    返回:
+    torch.Tensor: RMS延迟扩展, shape (B,)
+    """
+    # 1. 沿频域维度(最后一维)做IFFT，得到时域信道冲激响应(CIR)
+    cir = torch.fft.ifft(H_complex, dim=-1)
+
+    # 2. 计算功率延迟分布 (PDP)，即CIR模长的平方，并在天线维度上取平均
+    pdp = torch.abs(cir) ** 2
+    pdp = torch.mean(pdp, dim=1)  # Shape: (B, N)
+
+    # 确保PDP非负且总和不为零
+    pdp = torch.clamp(pdp, min=0)
+    pdp_sum = torch.sum(pdp, dim=1, keepdim=True) + 1e-8
+
+    # 3. 计算平均延迟 (一阶矩)
+    # 创建时间/延迟轴
+    delay_taps = torch.arange(H_complex.shape[-1], device=H_complex.device, dtype=torch.float32) * sample_time
+    mean_delay = torch.sum(pdp * delay_taps, dim=1, keepdim=True) / pdp_sum
+
+    # 4. 计算平均延迟的平方 (二阶矩)
+    mean_square_delay = torch.sum(pdp * (delay_taps ** 2), dim=1, keepdim=True) / pdp_sum
+
+    # 5. 计算RMS延迟扩展 (标准差)
+    rms_delay_spread = torch.sqrt(torch.clamp(mean_square_delay - mean_delay ** 2, min=0)).squeeze(-1)
+
+    return rms_delay_spread
 
 
 class FourierFeatureBlock(nn.Module):
@@ -149,10 +185,12 @@ class DepthwiseSeparableConv(nn.Module):
         out = self.bn(out)
         return self.relu(out)
 
+
 class GatedConv1d(nn.Module):
     """
     实现门控线性单元 (GLU) 的一维卷积模块。
     """
+
     def __init__(self, in_channels, out_channels, kernel_size, padding):
         super().__init__()
         self.conv_data = nn.Conv1d(in_channels, out_channels, kernel_size, padding=padding)
@@ -165,6 +203,7 @@ class GatedConv1d(nn.Module):
         # 逐元素相乘
         return data * gate
 
+
 class ConvDecoderHead(nn.Module):
     def __init__(self, in_channels, M, N, r, dropout_rate=0.1):
         super().__init__()
@@ -175,7 +214,6 @@ class ConvDecoderHead(nn.Module):
             GatedConv1d(in_channels, in_channels, kernel_size=3, padding=1),
             nn.BatchNorm1d(in_channels),
             nn.Dropout(dropout_rate),
-            # 最后的1x1卷积用于映射到最终维度
             nn.Conv1d(in_channels, 4 * r, kernel_size=1)
         )
 
@@ -193,67 +231,32 @@ class ConvDecoderHead(nn.Module):
 
         u = y_u_raw.view(B, self.M, self.r, 2)
         U_complex = torch.complex(u[..., 0], u[..., 1])
-
         v = y_v_raw.view(B, self.N, self.r, 2)
         V_complex = torch.complex(v[..., 0], v[..., 1])
 
         return U_complex, V_complex
 
-# class AttentionCouplingModule(nn.Module):
-#     """
-#     使用交叉注意力来耦合 U 和 V 的表征。
-#     它接收 U 和 V 的初始表征，并通过让它们相互关注来对其进行迭代优化。
-#     """
-#     def __init__(self, embed_dim, num_heads, num_layers=2, dropout_rate=0.1):
-#         super().__init__()
-#         self.num_layers = num_layers
-#         self.layers = nn.ModuleList([])
-#         for _ in range(num_layers):
-#             self.layers.append(nn.ModuleList([
-#                 # U attends to V
-#                 nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout_rate, batch_first=True),
-#                 # V attends to U
-#                 nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout_rate, batch_first=True),
-#                 nn.LayerNorm(embed_dim),
-#                 nn.LayerNorm(embed_dim),
-#                 nn.Sequential(nn.Linear(embed_dim, 4 * embed_dim), nn.ReLU(), nn.Linear(4 * embed_dim, embed_dim)),
-#                 nn.Sequential(nn.Linear(embed_dim, 4 * embed_dim), nn.ReLU(), nn.Linear(4 * embed_dim, embed_dim)),
-#                 nn.Dropout(dropout_rate),
-#                 nn.Dropout(dropout_rate)
-#             ]))
-#     def forward(self, u, v):
-#         """
-#         u: (B, M, r) - M是序列长度, r是特征维度(embed_dim)
-#         v: (B, N, r) - N是序列长度, r是特征维度(embed_dim)
-#         """
-#         # 为了处理复数，我们将实部和虚部叠加在特征维度上
-#         u_real, u_imag = u.real, u.imag
-#         v_real, v_imag = v.real, v.imag
-#
-#         # 将复数转换为 (B, Seq, 2*r) 的实数张量以输入注意力模块
-#         u_rep = torch.cat([u_real, u_imag], dim=-1)
-#         v_rep = torch.cat([v_real, v_imag], dim=-1)
-#
-#         for u_attend_v, v_attend_u, norm_u, norm_v, ffn_u, ffn_v, drop_u, drop_v in self.layers:
-#             # U 从 V 中获取信息
-#             u_updated, _ = u_attend_v(query=u_rep, key=v_rep, value=v_rep)
-#             u_rep = norm_u(u_rep + drop_u(u_updated))  # Add & Norm
-#             u_rep = norm_u(u_rep + drop_u(ffn_u(u_rep)))  # FFN
-#
-#             # V 从 U 中获取信息
-#             v_updated, _ = v_attend_u(query=v_rep, key=u_rep, value=u_rep)
-#             v_rep = norm_v(v_rep + drop_v(v_updated))  # Add & Norm
-#             v_rep = norm_v(v_rep + drop_v(ffn_v(v_rep)))  # FFN
-#
-#         # 将 (B, Seq, 2*r) 的表征转换回 (B, Seq, r) 的复数张量
-#         r = u.shape[-1]
-#         u_final_real, u_final_imag = u_rep.split(r, dim=-1)
-#         v_final_real, v_final_imag = v_rep.split(r, dim=-1)
-#
-#         u_final = torch.complex(u_final_real, u_final_imag)
-#         v_final = torch.complex(v_final_real, v_final_imag)
-#
-#         return u_final, v_final
+
+class SingleMatrixHead(nn.Module):
+    def __init__(self, in_channels, matrix_dim, r, dropout_rate=0.1):
+        super().__init__()
+        self.matrix_dim, self.r = matrix_dim, r
+        self.sequence_len = matrix_dim
+        self.gated_conv_block = nn.Sequential(
+            GatedConv1d(in_channels, in_channels, kernel_size=3, padding=1),
+            nn.BatchNorm1d(in_channels),
+            nn.Dropout(dropout_rate),
+            nn.Conv1d(in_channels, 2 * r, kernel_size=1)
+        )
+
+    def forward(self, x):
+        B = x.shape[0]
+        x_seq = x.view(B, -1, self.sequence_len)
+        processed_seq = self.gated_conv_block(x_seq)
+        y = processed_seq.permute(0, 2, 1)
+        y = y.view(B, self.matrix_dim, self.r, 2)
+        y_complex = torch.complex(y[..., 0], y[..., 1])
+        return y_complex
 
 
 class SvdNet(nn.Module):
@@ -262,7 +265,7 @@ class SvdNet(nn.Module):
         self.M, self.N, self.r = M, N, r
 
         self.enc = nn.Sequential(
-            FourierFeatureBlock(1, h=64, w=64), # 2 channels = 1 complex pairs
+            FourierFeatureBlock(1, h=64, w=64),  # 2 channels = 1 complex pairs
             # (2, 64, 64) -> (16, 32, 32)
             nn.Conv2d(2, 16, kernel_size=3, padding=1, stride=2, bias=False),
             nn.BatchNorm2d(16),
@@ -285,25 +288,54 @@ class SvdNet(nn.Module):
         )
 
         fc_input_size = 128
-        num_attn_heads = 4
-        num_coupling_layers = 2
 
-        self.decoder_head = ConvDecoderHead(fc_input_size, M, N, r)
-        # self.coupling_module = AttentionCouplingModule(embed_dim=2 * r, num_heads=num_attn_heads,
-        #                                                num_layers=num_coupling_layers)
-        # self.coupling_module = LightweightCouplingModule(embed_dim=2 * r)
+        self.conditioning_net = nn.Sequential(
+            nn.Linear(1, 64),
+            nn.ReLU(),
+            nn.Linear(64, 2 * fc_input_size)  # 输出 2*128=256
+        )
+        # 获取最后一层线性层
+        final_layer = self.conditioning_net[-1]
+        # 将其权重初始化为0
+        torch.nn.init.zeros_(final_layer.weight)
+        initial_bias = torch.zeros(2 * fc_input_size)
+        initial_bias[:fc_input_size] = 1.0  # 设置gamma的偏置为1
+        final_layer.bias.data = initial_bias
+
+        # self.multi_head = ConvDecoderHead(fc_input_size, M, N, r)
+        self.v_head = SingleMatrixHead(fc_input_size, N, r)
+        self.u_head = SingleMatrixHead(fc_input_size, M, r)
+
+        # self.cross_mod_net = nn.Sequential(
+        #     nn.Linear(r * 2, 64),  # 输入V的摘要，r=32 -> 输入维度64
+        #     nn.ReLU(),
+        #     nn.Linear(64, 2 * fc_input_size)  # 输出gamma和beta，维度2*128=256
+        # )
 
     def forward(self, x):
+        H_complex = torch.view_as_complex(x.permute(0, 2, 3, 1).contiguous())
+        delay_spread = calculate_rms_delay_spread(H_complex)  # Shape: (B,)
+
         fea = self.enc(x)
 
-        # U = self.u_head(fea)
-        # V = self.v_head(fea)
-        U, V = self.decoder_head(fea)
-        # U, V = self.coupling_module(U, V)
+        modulation_params = self.conditioning_net(delay_spread.unsqueeze(1))  # (B, 256)
+        #    b. 将参数切分为 gamma (用于缩放) 和 beta (用于平移)
+        gamma, beta = torch.chunk(modulation_params, 2, dim=1)
+        gamma = gamma.unsqueeze(-1).unsqueeze(-1)
+        beta = beta.unsqueeze(-1).unsqueeze(-1)
+        fea = fea * gamma + beta
 
-        U = qr_orthonormalize(U)
-        V = qr_orthonormalize(V)
-        return U, V
+        V_raw = self.v_head(fea)
+        # v_summary_complex = V_raw.mean(dim=1)
+        # v_summary_real = torch.cat([v_summary_complex.real, v_summary_complex.imag], dim=1)  # Shape: (B, r*2)
+        # cross_mod_params = self.cross_mod_net(v_summary_real)
+        # cross_gamma, cross_beta = torch.chunk(cross_mod_params, 2, dim=1)
+        # fea_for_u = fea * cross_gamma.unsqueeze(-1).unsqueeze(-1) + cross_beta.unsqueeze(-1).unsqueeze(-1)
+        U_raw = self.u_head(fea)
+
+        U_ortho = qr_orthonormalize(U_raw)
+        V_ortho = qr_orthonormalize(V_raw)
+        return U_ortho, V_ortho, U_raw, V_raw
 
 
 # =============================================================
@@ -341,6 +373,31 @@ def ae_loss(U, S, V, H, lam=1.0):
     return (recon + lam * (err_u + err_v)).mean()
 
 
+def supervised_ae_loss(U_ortho, V_ortho, S, H, U_raw, V_raw, lam=0.1):
+    B = H.size(0)
+
+    Sigma = torch.zeros(B, S.size(1), S.size(1),
+                        dtype=torch.complex64, device=H.device)
+    Sigma[:, torch.arange(S.size(1)), torch.arange(S.size(1))] = S.type(torch.complex64)
+    H_hat = U_ortho @ Sigma @ V_ortho.conj().permute(0, 2, 1)
+
+    num = torch.linalg.norm(H - H_hat, ord='fro', dim=(1, 2))
+    denom = torch.linalg.norm(H, ord='fro', dim=(1, 2)).clamp_min(1e-8)
+    recon_loss = num / denom
+
+    r = U_raw.shape[-1]
+    I_r = torch.eye(r, dtype=torch.complex64, device=H.device).expand(B, r, r)
+
+    err_u = torch.linalg.norm(U_raw.conj().permute(0, 2, 1) @ U_raw - I_r, ord='fro', dim=(1, 2))
+
+    err_v = torch.linalg.norm(V_raw.conj().permute(0, 2, 1) @ V_raw - I_r, ord='fro', dim=(1, 2))
+
+    # Combine the losses. The lambda value weights the importance of orthogonality.
+    total_loss = recon_loss.mean() + lam * (err_u.mean() + err_v.mean())
+
+    return total_loss
+
+
 def load_model(weight_path: str, M: int, N: int, r: int) -> nn.Module:
     model = SvdNet(M, N, r)
     state_dict = torch.load(weight_path, map_location="cuda" if torch.cuda.is_available() else "cpu")
@@ -354,11 +411,10 @@ def load_model(weight_path: str, M: int, N: int, r: int) -> nn.Module:
 def main(weight_path=None):
     # 1) 准备数据集
     # ROOTS = [Path.cwd() / f"data{i}" for i in (1, 2, 3)]
-    root = "./CompetitionData1"
     train_sets = []
     for idx in range(1, 4):
-        td = os.path.join(root, f"Round1TrainData{idx}.npy")
-        tl = os.path.join(root, f"Round1TrainLabel{idx}.npy")
+        td = os.path.join(DATASET_DIR, f"Round1TrainData{idx}.npy")
+        tl = os.path.join(DATASET_DIR, f"Round1TrainLabel{idx}.npy")
         train_sets.append(ChannelSvdDataset(td, tl))
     assert train_sets, "No training data found!"
 
@@ -385,10 +441,13 @@ def main(weight_path=None):
     else:
         print("Initializing new model")
         model = SvdNet(M, Nmat, r).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,
                                                            T_max=NUM_EPOCHS,
                                                            eta_min=1e-6)
+
+    # optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=LEARNING_RATE * 0.01)
+    # scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=LEARNING_RATE, epochs=NUM_EPOCHS, steps_per_epoch=len(train_loader), pct_start=0.01)
 
     os.makedirs(LOG_DIR, exist_ok=True)
     log_file = os.path.join(LOG_DIR, 'training_log.txt')
@@ -403,16 +462,19 @@ def main(weight_path=None):
         model.train()
         running, count = 0.0, 0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{NUM_EPOCHS}", ncols=80)
-        for x, H in pbar:
-            x, H = x.to(device), H.to(device)
+        for x_norm, H, fro_norm in pbar:
+            x_norm, H, fro_norm = x_norm.to(device), H.to(device), fro_norm.to(device)
             optimizer.zero_grad()
-            U, V = model(x)
-            S = analytic_sigma(U, V, torch.view_as_complex(x.permute(0, 2, 3, 1).contiguous()))
-            loss = ae_loss(U, S, V, H)
+            U_ortho, V_ortho, U_raw, V_raw = model(x_norm)
+            S_norm = analytic_sigma(U_ortho, V_ortho, torch.view_as_complex(x_norm.permute(0, 2, 3, 1).contiguous()))
+            S = S_norm * fro_norm.unsqueeze(1)  # 恢复原始范数
+            loss = ae_loss(U_ortho, S, V_ortho, H)
+            # loss = supervised_ae_loss(U_ortho, V_ortho, S, H, U_raw, V_raw, lam=0.1)
             loss.backward()
             optimizer.step()
+            scheduler.step()
 
-            b = x.size(0)
+            b = x_norm.size(0)
             running += loss.item() * b
             count += b
             pbar.set_postfix(loss=f"{loss.item():.4f}")
@@ -423,12 +485,13 @@ def main(weight_path=None):
         model.eval()
         v_sum, v_cnt = 0.0, 0
         with torch.no_grad():
-            for x, H in val_loader:
-                x, H = x.to(device), H.to(device)
-                U, V = model(x)
-                S = analytic_sigma(U, V, torch.view_as_complex(x.permute(0, 2, 3, 1).contiguous()))
+            for x_norm, H, fro_norm in val_loader:
+                x_norm, H, fro_norm = x_norm.to(device), H.to(device), fro_norm.to(device)
+                U, V, _, _ = model(x_norm)
+                S_norm = analytic_sigma(U, V, torch.view_as_complex(x_norm.permute(0, 2, 3, 1).contiguous()))
+                S = S_norm * fro_norm.unsqueeze(1)
                 l = ae_loss(U, S, V, H)
-                b = x.size(0)
+                b = x_norm.size(0)
                 v_sum += l.item() * b
                 v_cnt += b
 
@@ -445,18 +508,20 @@ def main(weight_path=None):
 
         with open(log_file, 'a') as f:
             f.write(
-                f"Epoch {epoch + 1}: Train Loss : {train_loss:.6f} Val Loss: {val_loss:.6f}\n")
+                f"Epoch {epoch}: Train Loss : {train_loss:.6f} Val Loss: {val_loss:.6f}\n")
 
     print(f"Training complete, best val_loss = {best_loss:.4f}")
 
 
 NUM_EPOCHS = 500
-LEARNING_RATE = 3e-4
+# LEARNING_RATE = 3e-4
+LEARNING_RATE = 3e-3
 BATCH_SIZE = 64
 timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 LOG_DIR = f"model/{timestamp}"
+DATASET_DIR = "./CompetitionData1"
 
 if __name__ == "__main__":
-    # model_path = "./0.3230.pth"
+    # model_path = "./svd_best_multi.pth"
     model_path = None
     main(model_path)

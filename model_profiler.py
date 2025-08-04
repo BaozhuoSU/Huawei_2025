@@ -65,23 +65,24 @@ def process_and_export(model: nn.Module, data_loader: DataLoader, output_path: s
 
     U_list, S_list, V_list = [], [], []
     with torch.no_grad():
-        for data in data_loader:
-            data = data.to(device)
-            U_pred, V_pred = model(data)
+        for x_norm, fro_norm in data_loader:
+            # print("Debug fro_norm:", fro_norm)
+            x_norm, fro_norm = x_norm.to(device), fro_norm.to(device)
+            U_pred, V_pred, _, _ = model(x_norm)
 
-            data = data.permute(0, 2, 3, 1).contiguous()
-            data_complex = torch.view_as_complex(data)
-            S_pred = analytic_sigma(U_pred, V_pred, data_complex).to(device)
+            x_norm = x_norm.permute(0, 2, 3, 1).contiguous()
+            x_norm_complex = torch.view_as_complex(x_norm)
+            S_norm = analytic_sigma(U_pred, V_pred, x_norm_complex).to(device)
+            S_pred = S_norm * fro_norm.unsqueeze(1)
 
             U_list.append(U_pred.cpu().numpy())
             S_list.append(S_pred.cpu().numpy())
             V_list.append(V_pred.cpu().numpy())
 
     U_arr = np.concatenate(U_list, axis=0)  # (Ns, M, r)
-    S_out = np.concatenate(S_list, axis=0)  # (Ns, r)
     V_arr = np.concatenate(V_list, axis=0)  # (Ns, N, r)
 
-    # real/imag 扩到最后一维 Q=2
+    S_out = np.concatenate(S_list, axis=0)  # (Ns, r)
     U_out = np.stack([U_arr.real, U_arr.imag], axis=-1)  # (Ns, M, r, 2)
     V_out = np.stack([V_arr.real, V_arr.imag], axis=-1)  # (Ns, N, r, 2)
     print(f"U shape: {U_out.shape}, S shape: {S_out.shape}, V shape: {V_out.shape}")
@@ -106,21 +107,22 @@ def validate_model(model: nn.Module, data_loader: DataLoader, device: str) -> fl
     num_samples = 0
 
     with torch.no_grad():
-        for data, labels in data_loader:
-            data = data.to(device)
-            labels = labels.to(device)
+        for x_norm, H, fro_norm in data_loader:
+            x_norm, H, fro_norm = x_norm.to(device), H.to(device), fro_norm.to(device)
 
-            U_pred, V_pred = model(data)
-            H_label = labels
+            U_pred, V_pred, _, _ = model(x_norm)
+            H_label = H
 
-            data = data.permute(0, 2, 3, 1).contiguous()
-            data_complex = torch.view_as_complex(data)
-            S_pred = analytic_sigma(U_pred, V_pred, data_complex).to(device)
+            x_norm = x_norm.permute(0, 2, 3, 1).contiguous()
+            x_norm_complex = torch.view_as_complex(x_norm)
+            S_norm = analytic_sigma(U_pred, V_pred, x_norm_complex).to(device)
+            S_pred = S_norm * fro_norm.unsqueeze(1)
 
             loss = ae_loss(U_pred, S_pred, V_pred, H_label)
 
-            total_loss += loss.item() * data.size(0)
-            num_samples += data.size(0)
+            b = x_norm.size(0)
+            total_loss += loss.item() * b
+            num_samples += b
 
     mean_loss = total_loss / num_samples
 
