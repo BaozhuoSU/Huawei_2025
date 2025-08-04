@@ -9,7 +9,7 @@ from torch import Tensor
 import numpy as np
 from torch.utils.data import DataLoader
 
-from su import SvdNet, ChannelSvdDataset, ae_loss, analytic_sigma
+from su import SvdNet, ChannelSvdDataset, ae_loss, analytic_sigma, SimpleChannelDataset
 
 
 def get_avg_flops(model: nn.Module, input_data: Tensor) -> float:
@@ -65,16 +65,30 @@ def process_and_export(model: nn.Module, data_loader: DataLoader, output_path: s
 
     U_list, S_list, V_list = [], [], []
     with torch.no_grad():
-        for x_norm, fro_norm in data_loader:
-            # print("Debug fro_norm:", fro_norm)
-            x_norm, fro_norm = x_norm.to(device), fro_norm.to(device)
-            U_pred, V_pred, _, _ = model(x_norm)
-
-            x_norm = x_norm.permute(0, 2, 3, 1).contiguous()
-            x_norm_complex = torch.view_as_complex(x_norm)
-            S_norm = analytic_sigma(U_pred, V_pred, x_norm_complex).to(device)
+        # for x_norm, fro_norm in data_loader:
+        for x_raw in data_loader:
+            # # print("Debug fro_norm:", fro_norm)
+            # x_norm, fro_norm = x_norm.to(device), fro_norm.to(device)
+            # U_pred, V_pred = model(x_norm)
+            # x_norm = x_norm.permute(0, 2, 3, 1).contiguous()
+            # x_norm_complex = torch.view_as_complex(x_norm)
+            # S_norm = analytic_sigma(U_pred, V_pred, x_norm_complex).to(device)
+            # S_pred = S_norm * fro_norm.unsqueeze(1)
+            x_raw = x_raw.to(device)
+            x_complex = torch.complex(x_raw[:, 0, :, :], x_raw[:, 1, :, :])
+            fro_norm = torch.linalg.norm(x_complex, ord='fro', dim=(1, 2)) + 1e-8
+            x_normalized_complex = x_complex / fro_norm.view(-1, 1, 1)
+            x_fft_complex = torch.fft.fft2(x_normalized_complex, norm='ortho')
+            x_model_input = torch.stack([
+                x_normalized_complex.real, x_normalized_complex.imag,
+                x_fft_complex.real, x_fft_complex.imag
+            ], dim=1).float()
+            x_normalized_for_sigma = torch.view_as_complex(
+                torch.stack([x_normalized_complex.real, x_normalized_complex.imag], dim=1).permute(0, 2, 3, 1).contiguous()
+            )
+            U_pred, V_pred = model(x_model_input)
+            S_norm = analytic_sigma(U_pred, V_pred, x_normalized_for_sigma)
             S_pred = S_norm * fro_norm.unsqueeze(1)
-
             U_list.append(U_pred.cpu().numpy())
             S_list.append(S_pred.cpu().numpy())
             V_list.append(V_pred.cpu().numpy())
@@ -87,7 +101,7 @@ def process_and_export(model: nn.Module, data_loader: DataLoader, output_path: s
     V_out = np.stack([V_arr.real, V_arr.imag], axis=-1)  # (Ns, N, r, 2)
     print(f"U shape: {U_out.shape}, S shape: {S_out.shape}, V shape: {V_out.shape}")
 
-    dummy = torch.randn(1, 2, M, N).to(device)
+    dummy = torch.randn(1, 4, M, N).to(device)
     C = get_avg_flops(model, dummy)
     print(f"Average FLOPs for file {file_index}: {C:.4f} M")
 
@@ -107,20 +121,36 @@ def validate_model(model: nn.Module, data_loader: DataLoader, device: str) -> fl
     num_samples = 0
 
     with torch.no_grad():
-        for x_norm, H, fro_norm in data_loader:
-            x_norm, H, fro_norm = x_norm.to(device), H.to(device), fro_norm.to(device)
-
-            U_pred, V_pred, _, _ = model(x_norm)
-            H_label = H
-
-            x_norm = x_norm.permute(0, 2, 3, 1).contiguous()
-            x_norm_complex = torch.view_as_complex(x_norm)
-            S_norm = analytic_sigma(U_pred, V_pred, x_norm_complex).to(device)
+        # for x_norm, H, fro_norm in data_loader:
+        for x_raw, H_label in data_loader:
+            # x_norm, H, fro_norm = x_norm.to(device), H.to(device), fro_norm.to(device)
+            # U_pred, V_pred = model(x_norm)
+            # H_label = H
+            # x_norm = x_norm.permute(0, 2, 3, 1).contiguous()
+            # x_norm_complex = torch.view_as_complex(x_norm)
+            # S_norm = analytic_sigma(U_pred, V_pred, x_norm_complex).to(device)
+            # S_pred = S_norm * fro_norm.unsqueeze(1)
+            # loss = ae_loss(U_pred, S_pred, V_pred, H_label)
+            # b = x_norm.size(0)
+            # total_loss += loss.item() * b
+            # num_samples += b
+            x_raw, H_label = x_raw.to(device), H_label.to(device)
+            x_complex = torch.complex(x_raw[:, 0, :, :], x_raw[:, 1, :, :])
+            fro_norm = torch.linalg.norm(x_complex, ord='fro', dim=(1, 2)) + 1e-8
+            x_normalized_complex = x_complex / fro_norm.view(-1, 1, 1)
+            x_fft_complex = torch.fft.fft2(x_normalized_complex, norm='ortho')
+            x_model_input = torch.stack([
+                x_normalized_complex.real, x_normalized_complex.imag,
+                x_fft_complex.real, x_fft_complex.imag
+            ], dim=1).float()
+            x_normalized_for_sigma = torch.view_as_complex(
+                torch.stack([x_normalized_complex.real, x_normalized_complex.imag], dim=1).permute(0, 2, 3, 1).contiguous()
+            )
+            U_pred, V_pred = model(x_model_input)
+            S_norm = analytic_sigma(U_pred, V_pred, x_normalized_for_sigma)
             S_pred = S_norm * fro_norm.unsqueeze(1)
-
             loss = ae_loss(U_pred, S_pred, V_pred, H_label)
-
-            b = x_norm.size(0)
+            b = x_raw.size(0)
             total_loss += loss.item() * b
             num_samples += b
 
@@ -146,7 +176,7 @@ if __name__ == "__main__":
         data_path = os.path.join(DATA_DIR, f'Round1TrainData{idx}.npy')
         label_path = os.path.join(DATA_DIR, f'Round1TrainLabel{idx}.npy')
 
-        train_dataset = ChannelSvdDataset(
+        train_dataset = SimpleChannelDataset(
             data_path=data_path,
             label_path=label_path
         )
@@ -157,10 +187,11 @@ if __name__ == "__main__":
             num_workers=0,
             pin_memory=True
         )
+
         mean_loss = validate_model(model, train_dataloader, DEVICE)
 
         test_path = os.path.join(DATA_DIR, f'Round1TestData{idx}.npy')
-        test_dataset = ChannelSvdDataset(
+        test_dataset = SimpleChannelDataset(
             data_path=test_path,
         )
         test_dataloader = DataLoader(
@@ -170,5 +201,6 @@ if __name__ == "__main__":
             num_workers=0,
             pin_memory=True
         )
+
 
         process_and_export(model, test_dataloader, OUTPUT_DIR, idx)

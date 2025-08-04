@@ -56,82 +56,123 @@ class ChannelSvdDataset(Dataset):
             return x_normalized, fro_norm
 
 
+class SimpleChannelDataset(Dataset):
+    def __init__(self, data_path, label_path=None):
+        self.X = np.load(data_path, mmap_mode='r').transpose(0, 3, 1, 2)
+        self.M, self.N = self.X.shape[2], self.X.shape[3]
+
+        if label_path is not None:
+            lab = np.load(label_path, mmap_mode='r')
+            if lab.ndim == 4 and lab.shape[-1] == 2:
+                self.H = (lab[..., 0] + 1j * lab[..., 1]).astype(np.complex64)
+            else:
+                self.H = lab
+        else:
+            self.H = None
+
+    def __len__(self):
+        return self.X.shape[0]
+
+    def __getitem__(self, idx):
+        x = torch.from_numpy(self.X[idx]).float()  # (2, M, N)
+        if self.H is not None:
+            h = torch.from_numpy(self.H[idx])  # (M, N) complex64
+            return x, h
+        else:
+            return x
+
+
+class AugmentationWrapper(Dataset):
+    """
+    一个通用的数据增强包装器。
+    它接收一个现有的数据集对象，并在__getitem__时动态应用增强。
+    """
+
+    def __init__(self,
+                 base_dataset: Dataset,
+                 p_shift: float = 0.5,
+                 p_scale: float = 0.5,
+                 scale_range_db: tuple = (-10, 10),
+                 p_noise: float = 0.5,
+                 noise_std: float = 0.01):
+
+        self.base_dataset = base_dataset
+        self.p_shift = p_shift
+        self.p_scale = p_scale
+        self.scale_range_db = scale_range_db
+        self.p_noise = p_noise
+        self.noise_std = noise_std
+
+        # 从基础数据集中获取 M, N (如果需要)
+        # 这部分取决于基础数据集的实现，为简化起见，我们假设 M, N = 64, 64
+        self.M, self.N = 64, 64
+
+    def __len__(self) -> int:
+        return len(self.base_dataset)
+
+    def __getitem__(self, idx: int):
+        # 1. 从原始数据集中获取未经增强的数据
+        # base_dataset 返回的是 (x, h) 元组
+        x, h = self.base_dataset[idx]
+
+        # --- 随机循环移位 ---
+        if torch.rand(1).item() < self.p_shift:
+            shift_h = torch.randint(0, self.M, (1,)).item()
+            shift_w = torch.randint(0, self.N, (1,)).item()
+            x = torch.roll(x, shifts=(shift_h, shift_w), dims=(1, 2))
+            if h is not None:
+                h = torch.roll(h, shifts=(shift_h, shift_w), dims=(0, 1))
+
+        # --- 随机功率缩放 ---
+        if torch.rand(1).item() < self.p_scale:
+            x_complex = torch.complex(x[0], x[1])
+            log_min = self.scale_range_db[0] / 10.0
+            log_max = self.scale_range_db[1] / 10.0
+            power_scale = 10 ** (torch.rand(1).item() * (log_max - log_min) + log_min)
+            amplitude_scale = power_scale ** 0.5
+            x_complex = x_complex * amplitude_scale
+            x = torch.stack([x_complex.real, x_complex.imag]).float()
+            if h is not None:
+                h = h * amplitude_scale
+
+        # --- 随机高斯噪声注入 ---
+        if torch.rand(1).item() < self.p_noise:
+            noise = torch.randn_like(x) * self.noise_std
+            x = x + noise
+
+        return x, h
+
 # =============================================================
 # 定义：SvdNet 模型
 # ———— 轻量级 Conv→GAP→FC → 输出 U, V
 # =============================================================
-def qr_orthonormalize(x_raw):
-    """
-    使用 QR 分解来使矩阵列正交。
-    x_raw: 神经网络输出的原始矩阵, shape (B, M, r)
-    """
-    # mode='reduced' 会返回一个 (M, r) 的 Q 矩阵
-    Q, _ = torch.linalg.qr(x_raw, mode='reduced')
-    return Q
 
-
-def calculate_rms_delay_spread(H_complex, sample_time=1.0):
-    """
-    计算一批MIMO信道矩阵的RMS延迟扩展。
-
-    参数:
-    H_complex (torch.Tensor): 复数信道矩阵, shape (B, M, N)。假设N是频域/子载波维度。
-    sample_time (float): 采样时间或时延单元的间隔，用于给延迟扩展一个物理尺度。默认为1.0。
-
-    返回:
-    torch.Tensor: RMS延迟扩展, shape (B,)
-    """
-    # 1. 沿频域维度(最后一维)做IFFT，得到时域信道冲激响应(CIR)
-    cir = torch.fft.ifft(H_complex, dim=-1)
-
-    # 2. 计算功率延迟分布 (PDP)，即CIR模长的平方，并在天线维度上取平均
-    pdp = torch.abs(cir) ** 2
-    pdp = torch.mean(pdp, dim=1)  # Shape: (B, N)
-
-    # 确保PDP非负且总和不为零
-    pdp = torch.clamp(pdp, min=0)
-    pdp_sum = torch.sum(pdp, dim=1, keepdim=True) + 1e-8
-
-    # 3. 计算平均延迟 (一阶矩)
-    # 创建时间/延迟轴
-    delay_taps = torch.arange(H_complex.shape[-1], device=H_complex.device, dtype=torch.float32) * sample_time
-    mean_delay = torch.sum(pdp * delay_taps, dim=1, keepdim=True) / pdp_sum
-
-    # 4. 计算平均延迟的平方 (二阶矩)
-    mean_square_delay = torch.sum(pdp * (delay_taps ** 2), dim=1, keepdim=True) / pdp_sum
-
-    # 5. 计算RMS延迟扩展 (标准差)
-    rms_delay_spread = torch.sqrt(torch.clamp(mean_square_delay - mean_delay ** 2, min=0)).squeeze(-1)
-
-    return rms_delay_spread
-
-
-class FourierFeatureBlock(nn.Module):
-    def __init__(self, in_channels, h, w):
-        super().__init__()
-
-        self.weights = nn.Parameter(torch.randn(in_channels, h, w, dtype=torch.cfloat))
-
-        self.alpha = nn.Parameter(torch.zeros(1))
-
-    def forward(self, x):
-        # This logic for creating a complex tensor is correct and stays the same
-        if x.shape[1] == 2:
-            x_complex = torch.complex(x[:, 0, :, :], x[:, 1, :, :]).unsqueeze(1)
-        else:
-            b, c, h, w = x.shape
-            x_complex = torch.complex(x[:, 0:c:2, :, :], x[:, 1:c:2, :, :])
-
-        x_fft = torch.fft.fft2(x_complex, norm='ortho')
-        x_filtered = torch.einsum("bchw,chw->bchw", x_fft, self.weights)
-        x_ifft = torch.fft.ifft2(x_filtered, s=(x_complex.shape[-2], x_complex.shape[-1]), norm='ortho')
-
-        x_out_real = x_ifft.real
-        x_out_imag = x_ifft.imag
-        x_out = torch.cat([x_out_real, x_out_imag], dim=1)
-
-        # The residual connection is correct and stays the same
-        return x + self.alpha * x_out
+# class FourierFeatureBlock(nn.Module):
+#     def __init__(self, in_channels, h, w):
+#         super().__init__()
+#
+#         self.weights = nn.Parameter(torch.randn(in_channels, h, w, dtype=torch.cfloat))
+#
+#         self.alpha = nn.Parameter(torch.zeros(1))
+#
+#     def forward(self, x):
+#         # This logic for creating a complex tensor is correct and stays the same
+#         if x.shape[1] == 2:
+#             x_complex = torch.complex(x[:, 0, :, :], x[:, 1, :, :]).unsqueeze(1)
+#         else:
+#             b, c, h, w = x.shape
+#             x_complex = torch.complex(x[:, 0:c:2, :, :], x[:, 1:c:2, :, :])
+#
+#         x_fft = torch.fft.fft2(x_complex, norm='ortho')
+#         x_filtered = torch.einsum("bchw,chw->bchw", x_fft, self.weights)
+#         x_ifft = torch.fft.ifft2(x_filtered, s=(x_complex.shape[-2], x_complex.shape[-1]), norm='ortho')
+#
+#         x_out_real = x_ifft.real
+#         x_out_imag = x_ifft.imag
+#         x_out = torch.cat([x_out_real, x_out_imag], dim=1)
+#
+#         # The residual connection is correct and stays the same
+#         return x + self.alpha * x_out
 
 
 class CBAM(nn.Module):
@@ -169,7 +210,6 @@ class CBAM(nn.Module):
 
         return x
 
-
 class DepthwiseSeparableConv(nn.Module):
     def __init__(self, in_channels, out_channels, stride=1):
         super().__init__()
@@ -186,156 +226,99 @@ class DepthwiseSeparableConv(nn.Module):
         return self.relu(out)
 
 
-class GatedConv1d(nn.Module):
-    """
-    实现门控线性单元 (GLU) 的一维卷积模块。
-    """
-
-    def __init__(self, in_channels, out_channels, kernel_size, padding):
+class ResidualBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1):
         super().__init__()
-        self.conv_data = nn.Conv1d(in_channels, out_channels, kernel_size, padding=padding)
-        self.conv_gate = nn.Conv1d(in_channels, out_channels, kernel_size, padding=padding)
+
+        self.path = nn.Sequential(
+            DepthwiseSeparableConv(in_channels, out_channels, stride=stride),
+            CBAM(out_channels)
+        )
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False)
 
     def forward(self, x):
-        # 计算数据通路和门控通路
-        data = self.conv_data(x)
-        gate = torch.sigmoid(self.conv_gate(x))
-        # 逐元素相乘
-        return data * gate
+        # 残差连接
+        return nn.functional.relu(self.shortcut(x) + self.path(x))
 
 
-class ConvDecoderHead(nn.Module):
-    def __init__(self, in_channels, M, N, r, dropout_rate=0.1):
+class GlobalDecoder(nn.Module):
+    def __init__(self, in_channels, M, N, r, hidden_dim=512):
         super().__init__()
-        self.M, self.N, self.r = M, N, r
+        self.r = r
+        self.M = M
+        self.N = N
 
-        # 使用GLU增强的卷积模块
-        self.gated_conv_block = nn.Sequential(
-            GatedConv1d(in_channels, in_channels, kernel_size=3, padding=1),
-            nn.BatchNorm1d(in_channels),
-            nn.Dropout(dropout_rate),
-            nn.Conv1d(in_channels, 4 * r, kernel_size=1)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.flatten = nn.Flatten()
+
+        output_dim = 2 * M * r + 2 * N * r  # 8192
+        self.mlp = nn.Sequential(
+            nn.Linear(in_channels, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim)
         )
 
     def forward(self, x):
-        # 这部分逻辑和 UnifiedConvDecoderHead 完全相同
-        B, C, H, W = x.shape
-        sequence_len = H * W
-        x_seq = x.view(B, C, sequence_len)
-
-        # 使用增强的卷积块
-        processed_seq = self.gated_conv_block(x_seq)
-
-        y = processed_seq.permute(0, 2, 1)
-        y_u_raw, y_v_raw = torch.split(y, [2 * self.r, 2 * self.r], dim=-1)
-
-        u = y_u_raw.view(B, self.M, self.r, 2)
-        U_complex = torch.complex(u[..., 0], u[..., 1])
-        v = y_v_raw.view(B, self.N, self.r, 2)
-        V_complex = torch.complex(v[..., 0], v[..., 1])
-
-        return U_complex, V_complex
-
-
-class SingleMatrixHead(nn.Module):
-    def __init__(self, in_channels, matrix_dim, r, dropout_rate=0.1):
-        super().__init__()
-        self.matrix_dim, self.r = matrix_dim, r
-        self.sequence_len = matrix_dim
-        self.gated_conv_block = nn.Sequential(
-            GatedConv1d(in_channels, in_channels, kernel_size=3, padding=1),
-            nn.BatchNorm1d(in_channels),
-            nn.Dropout(dropout_rate),
-            nn.Conv1d(in_channels, 2 * r, kernel_size=1)
-        )
-
-    def forward(self, x):
+        # x: 输入特征图, shape (B, C, H, W), e.g., (B, 32, 8, 8)
         B = x.shape[0]
-        x_seq = x.view(B, -1, self.sequence_len)
-        processed_seq = self.gated_conv_block(x_seq)
-        y = processed_seq.permute(0, 2, 1)
-        y = y.view(B, self.matrix_dim, self.r, 2)
-        y_complex = torch.complex(y[..., 0], y[..., 1])
-        return y_complex
 
+        global_vec = self.flatten(self.pool(x))  # (B, C)
+        output_vec = self.mlp(global_vec)  # (B, 8192)
+
+        p = 0
+        U_r = output_vec[:, p:p + self.M * self.r].reshape(B, self.M, self.r)
+        p += self.M * self.r
+        U_i = output_vec[:, p:p + self.M * self.r].reshape(B, self.M, self.r)
+        p += self.M * self.r
+        V_r = output_vec[:, p:p + self.N * self.r].reshape(B, self.N, self.r)
+        p += self.N * self.r
+        V_i = output_vec[:, p:p + self.N * self.r].reshape(B, self.N, self.r)
+
+        U = torch.complex(U_r, U_i)
+        V = torch.complex(V_r, V_i)
+
+        return U, V
 
 class SvdNet(nn.Module):
     def __init__(self, M=64, N=64, r=32):
         super().__init__()
         self.M, self.N, self.r = M, N, r
 
-        self.enc = nn.Sequential(
-            FourierFeatureBlock(1, h=64, w=64),  # 2 channels = 1 complex pairs
-            # (2, 64, 64) -> (16, 32, 32)
-            nn.Conv2d(2, 16, kernel_size=3, padding=1, stride=2, bias=False),
+        self.spatial_branch = nn.Sequential(
+            nn.Conv2d(2, 16, kernel_size=3, padding=1, stride=2, bias=False),  # 64x64 -> 32x32
             nn.BatchNorm2d(16),
             nn.ReLU(),
-
-            FourierFeatureBlock(8, h=32, w=32),  # 16 channels = 8 complex pairs
-            CBAM(16),
-            # (16, 32, 32) -> (32, 16, 16)
-            DepthwiseSeparableConv(16, 32, stride=2),
-            FourierFeatureBlock(16, h=16, w=16),  # 32 channels = 16 complex pairs
-            CBAM(32),
-            # (32, 16, 16) -> (64, 8, 8)
-            DepthwiseSeparableConv(32, 64, stride=2),
-            FourierFeatureBlock(32, h=8, w=8),  # 64 channels = 32 complex pairs
-            CBAM(64),
-            # (64, 8, 8) -> (128, 8, 8)
-            DepthwiseSeparableConv(64, 128, stride=1),
-            CBAM(128),
-
+            ResidualBlock(16, 32, stride=2)  # 32x32 -> 16x16
+        )
+        self.frequency_branch = nn.Sequential(
+            nn.Conv2d(2, 16, kernel_size=3, padding=1, stride=2, bias=False),  # 64x64 -> 32x32
+            nn.BatchNorm2d(16),
+            nn.ReLU(),
+            ResidualBlock(16, 32, stride=2)  # 32x32 -> 16x16
+        )
+        self.shared_encoder = nn.Sequential(
+            ResidualBlock(64, 128, stride=2),  # 16x16 -> 8x8
+            ResidualBlock(128, 128, stride=1),
+            CBAM(128)
         )
 
         fc_input_size = 128
+        self.decoder = GlobalDecoder(fc_input_size, M, N, r, hidden_dim=512)
 
-        self.conditioning_net = nn.Sequential(
-            nn.Linear(1, 64),
-            nn.ReLU(),
-            nn.Linear(64, 2 * fc_input_size)  # 输出 2*128=256
-        )
-        # 获取最后一层线性层
-        final_layer = self.conditioning_net[-1]
-        # 将其权重初始化为0
-        torch.nn.init.zeros_(final_layer.weight)
-        initial_bias = torch.zeros(2 * fc_input_size)
-        initial_bias[:fc_input_size] = 1.0  # 设置gamma的偏置为1
-        final_layer.bias.data = initial_bias
 
-        # self.multi_head = ConvDecoderHead(fc_input_size, M, N, r)
-        self.v_head = SingleMatrixHead(fc_input_size, N, r)
-        self.u_head = SingleMatrixHead(fc_input_size, M, r)
+    def forward(self, x, fro_norm):
+        # fea = self.enc(x)
+        x_spatial = x[:, 0:2, :, :]  # 前两个通道
+        x_freq = x[:, 2:4, :, :]  # 后两个通道
+        fea_spatial = self.spatial_branch(x_spatial)
+        fea_freq = self.frequency_branch(x_freq)
+        fea_concat = torch.cat([fea_spatial, fea_freq], dim=1)  # (B, 32+32, 16, 16)
+        fea = self.shared_encoder(fea_concat)
 
-        # self.cross_mod_net = nn.Sequential(
-        #     nn.Linear(r * 2, 64),  # 输入V的摘要，r=32 -> 输入维度64
-        #     nn.ReLU(),
-        #     nn.Linear(64, 2 * fc_input_size)  # 输出gamma和beta，维度2*128=256
-        # )
-
-    def forward(self, x):
-        H_complex = torch.view_as_complex(x.permute(0, 2, 3, 1).contiguous())
-        delay_spread = calculate_rms_delay_spread(H_complex)  # Shape: (B,)
-
-        fea = self.enc(x)
-
-        modulation_params = self.conditioning_net(delay_spread.unsqueeze(1))  # (B, 256)
-        #    b. 将参数切分为 gamma (用于缩放) 和 beta (用于平移)
-        gamma, beta = torch.chunk(modulation_params, 2, dim=1)
-        gamma = gamma.unsqueeze(-1).unsqueeze(-1)
-        beta = beta.unsqueeze(-1).unsqueeze(-1)
-        fea = fea * gamma + beta
-
-        V_raw = self.v_head(fea)
-        # v_summary_complex = V_raw.mean(dim=1)
-        # v_summary_real = torch.cat([v_summary_complex.real, v_summary_complex.imag], dim=1)  # Shape: (B, r*2)
-        # cross_mod_params = self.cross_mod_net(v_summary_real)
-        # cross_gamma, cross_beta = torch.chunk(cross_mod_params, 2, dim=1)
-        # fea_for_u = fea * cross_gamma.unsqueeze(-1).unsqueeze(-1) + cross_beta.unsqueeze(-1).unsqueeze(-1)
-        U_raw = self.u_head(fea)
-
-        U_ortho = qr_orthonormalize(U_raw)
-        V_ortho = qr_orthonormalize(V_raw)
-        return U_ortho, V_ortho, U_raw, V_raw
+        U, V = self.decoder(fea)
+        return U, V
 
 
 # =============================================================
@@ -372,32 +355,6 @@ def ae_loss(U, S, V, H, lam=1.0):
     err_v = torch.linalg.norm(VV - I_r, ord='fro', dim=(1, 2))
     return (recon + lam * (err_u + err_v)).mean()
 
-
-def supervised_ae_loss(U_ortho, V_ortho, S, H, U_raw, V_raw, lam=0.1):
-    B = H.size(0)
-
-    Sigma = torch.zeros(B, S.size(1), S.size(1),
-                        dtype=torch.complex64, device=H.device)
-    Sigma[:, torch.arange(S.size(1)), torch.arange(S.size(1))] = S.type(torch.complex64)
-    H_hat = U_ortho @ Sigma @ V_ortho.conj().permute(0, 2, 1)
-
-    num = torch.linalg.norm(H - H_hat, ord='fro', dim=(1, 2))
-    denom = torch.linalg.norm(H, ord='fro', dim=(1, 2)).clamp_min(1e-8)
-    recon_loss = num / denom
-
-    r = U_raw.shape[-1]
-    I_r = torch.eye(r, dtype=torch.complex64, device=H.device).expand(B, r, r)
-
-    err_u = torch.linalg.norm(U_raw.conj().permute(0, 2, 1) @ U_raw - I_r, ord='fro', dim=(1, 2))
-
-    err_v = torch.linalg.norm(V_raw.conj().permute(0, 2, 1) @ V_raw - I_r, ord='fro', dim=(1, 2))
-
-    # Combine the losses. The lambda value weights the importance of orthogonality.
-    total_loss = recon_loss.mean() + lam * (err_u.mean() + err_v.mean())
-
-    return total_loss
-
-
 def load_model(weight_path: str, M: int, N: int, r: int) -> nn.Module:
     model = SvdNet(M, N, r)
     state_dict = torch.load(weight_path, map_location="cuda" if torch.cuda.is_available() else "cpu")
@@ -415,7 +372,7 @@ def main(weight_path=None):
     for idx in range(1, 4):
         td = os.path.join(DATASET_DIR, f"Round1TrainData{idx}.npy")
         tl = os.path.join(DATASET_DIR, f"Round1TrainLabel{idx}.npy")
-        train_sets.append(ChannelSvdDataset(td, tl))
+        train_sets.append(SimpleChannelDataset(td, tl))
     assert train_sets, "No training data found!"
 
     full_ds = ConcatDataset(train_sets)
@@ -427,6 +384,13 @@ def main(weight_path=None):
         full_ds, [n_train, n_val],
         generator=torch.Generator().manual_seed(42)
     )
+
+    # train_ds = AugmentationWrapper(
+    #     base_dataset=train_ds,
+    #     p_shift=0.5,
+    #     p_scale=0.5,
+    #     p_noise=0.3
+    # )
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
@@ -446,8 +410,8 @@ def main(weight_path=None):
                                                            T_max=NUM_EPOCHS,
                                                            eta_min=1e-6)
 
-    # optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=LEARNING_RATE * 0.01)
-    # scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=LEARNING_RATE, epochs=NUM_EPOCHS, steps_per_epoch=len(train_loader), pct_start=0.01)
+    # optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
+    # scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=LEARNING_RATE, epochs=NUM_EPOCHS, steps_per_epoch=len(train_loader))
 
     os.makedirs(LOG_DIR, exist_ok=True)
     log_file = os.path.join(LOG_DIR, 'training_log.txt')
@@ -462,19 +426,36 @@ def main(weight_path=None):
         model.train()
         running, count = 0.0, 0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{NUM_EPOCHS}", ncols=80)
-        for x_norm, H, fro_norm in pbar:
-            x_norm, H, fro_norm = x_norm.to(device), H.to(device), fro_norm.to(device)
+        for x_raw, H in pbar:
+            # x_norm, H, fro_norm = x_norm.to(device), H.to(device), fro_norm.to(device)
+
+            x_raw, H = x_raw.to(device), H.to(device)
+            x_complex = torch.complex(x_raw[:, 0, :, :], x_raw[:, 1, :, :])
+            fro_norm = torch.linalg.norm(x_complex, ord='fro', dim=(1, 2)) + 1e-8
+            x_normalized_complex = x_complex / fro_norm.view(-1, 1, 1)
+            x_fft_complex = torch.fft.fft2(x_normalized_complex, norm='ortho')
+            x_out = torch.stack([
+                x_normalized_complex.real,
+                x_normalized_complex.imag,
+                x_fft_complex.real,
+                x_fft_complex.imag
+            ], dim=1).float()
+            x_normalized = torch.stack([
+                x_normalized_complex.real,
+                x_normalized_complex.imag
+            ], dim=1).float()
+
             optimizer.zero_grad()
-            U_ortho, V_ortho, U_raw, V_raw = model(x_norm)
-            S_norm = analytic_sigma(U_ortho, V_ortho, torch.view_as_complex(x_norm.permute(0, 2, 3, 1).contiguous()))
+            U, V = model(x_out)
+            S_norm = analytic_sigma(U, V, torch.view_as_complex(x_normalized.permute(0, 2, 3, 1).contiguous()))
             S = S_norm * fro_norm.unsqueeze(1)  # 恢复原始范数
-            loss = ae_loss(U_ortho, S, V_ortho, H)
+            loss = ae_loss(U, S, V, H)
             # loss = supervised_ae_loss(U_ortho, V_ortho, S, H, U_raw, V_raw, lam=0.1)
             loss.backward()
             optimizer.step()
             scheduler.step()
 
-            b = x_norm.size(0)
+            b = x_normalized.size(0)
             running += loss.item() * b
             count += b
             pbar.set_postfix(loss=f"{loss.item():.4f}")
@@ -485,13 +466,38 @@ def main(weight_path=None):
         model.eval()
         v_sum, v_cnt = 0.0, 0
         with torch.no_grad():
-            for x_norm, H, fro_norm in val_loader:
-                x_norm, H, fro_norm = x_norm.to(device), H.to(device), fro_norm.to(device)
-                U, V, _, _ = model(x_norm)
-                S_norm = analytic_sigma(U, V, torch.view_as_complex(x_norm.permute(0, 2, 3, 1).contiguous()))
+            # for x_norm, H, fro_norm, x_fft in val_loader:
+            #     x_norm, H, fro_norm, x_fft = x_norm.to(device), H.to(device), fro_norm.to(device), x_fft.to(device)
+            #     U, V = model(x_fft)
+            #     S_norm = analytic_sigma(U, V, torch.view_as_complex(x_norm.permute(0, 2, 3, 1).contiguous()))
+            #     S = S_norm * fro_norm.unsqueeze(1)
+            #     l = ae_loss(U, S, V, H)
+            #     b = x_norm.size(0)
+            #     v_sum += l.item() * b
+            #     v_cnt += b
+            for x_raw, H in val_loader:
+                x_raw, H = x_raw.to(device), H.to(device)
+
+                x_complex = torch.complex(x_raw[:, 0, :, :], x_raw[:, 1, :, :])
+                fro_norm = torch.linalg.norm(x_complex, ord='fro', dim=(1, 2)) + 1e-8
+                x_normalized_complex = x_complex / fro_norm.view(-1, 1, 1)
+
+                x_fft_complex = torch.fft.fft2(x_normalized_complex, norm='ortho')
+                x_model_input = torch.stack([
+                    x_normalized_complex.real, x_normalized_complex.imag,
+                    x_fft_complex.real, x_fft_complex.imag
+                ], dim=1).float()
+
+                x_normalized = torch.stack([
+                    x_normalized_complex.real, x_normalized_complex.imag
+                ], dim=1).float()
+
+                U, V = model(x_model_input)
+
+                S_norm = analytic_sigma(U, V, torch.view_as_complex(x_normalized.permute(0, 2, 3, 1).contiguous()))
                 S = S_norm * fro_norm.unsqueeze(1)
                 l = ae_loss(U, S, V, H)
-                b = x_norm.size(0)
+                b = x_raw.size(0)
                 v_sum += l.item() * b
                 v_cnt += b
 
@@ -522,6 +528,6 @@ LOG_DIR = f"model/{timestamp}"
 DATASET_DIR = "./CompetitionData1"
 
 if __name__ == "__main__":
-    # model_path = "./svd_best_multi.pth"
-    model_path = None
+    model_path = "./svd_best_multi.pth"
+    # model_path = None
     main(model_path)
