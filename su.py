@@ -305,10 +305,10 @@ class SvdNet(nn.Module):
         )
 
         fc_input_size = 128
-        self.decoder = GlobalDecoder(fc_input_size, M, N, r, hidden_dim=512)
+        self.decoder = GlobalDecoder(fc_input_size, M, N, r, hidden_dim=400)
 
 
-    def forward(self, x, fro_norm):
+    def forward(self, x):
         # fea = self.enc(x)
         x_spatial = x[:, 0:2, :, :]  # 前两个通道
         x_freq = x[:, 2:4, :, :]  # 后两个通道
@@ -528,6 +528,6 @@ LOG_DIR = f"model/{timestamp}"
 DATASET_DIR = "./CompetitionData1"
 
 if __name__ == "__main__":
-    model_path = "./svd_best_multi.pth"
-    # model_path = None
+    # model_path = "./svd_best_multi.pth"
+    model_path = None
     main(model_path)
