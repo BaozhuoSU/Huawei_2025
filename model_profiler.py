@@ -79,9 +79,21 @@ def process_and_export(model: nn.Module, data_loader: DataLoader, output_path: s
             fro_norm = torch.linalg.norm(x_complex, ord='fro', dim=(1, 2)) + 1e-8
             x_normalized_complex = x_complex / fro_norm.view(-1, 1, 1)
             x_fft_complex = torch.fft.fft2(x_normalized_complex, norm='ortho')
+
+            x_mag = torch.abs(x_normalized_complex)
+            x_log_power = torch.log(x_mag ** 2 + 1e-8)
+            x_fft_mag = torch.abs(x_fft_complex)
+            x_fft_log_power = torch.log(x_fft_mag ** 2 + 1e-8)
+
             x_model_input = torch.stack([
-                x_normalized_complex.real, x_normalized_complex.imag,
-                x_fft_complex.real, x_fft_complex.imag
+                x_normalized_complex.real,
+                x_normalized_complex.imag,
+                x_mag,
+                x_log_power,
+                x_fft_complex.real,
+                x_fft_complex.imag,
+                x_fft_mag,
+                x_fft_log_power
             ], dim=1).float()
             x_normalized_for_sigma = torch.view_as_complex(
                 torch.stack([x_normalized_complex.real, x_normalized_complex.imag], dim=1).permute(0, 2, 3, 1).contiguous()
@@ -101,7 +113,7 @@ def process_and_export(model: nn.Module, data_loader: DataLoader, output_path: s
     V_out = np.stack([V_arr.real, V_arr.imag], axis=-1)  # (Ns, N, r, 2)
     print(f"U shape: {U_out.shape}, S shape: {S_out.shape}, V shape: {V_out.shape}")
 
-    dummy = torch.randn(1, 4, M, N).to(device)
+    dummy = torch.randn(1, 8, M, N).to(device)
     C = get_avg_flops(model, dummy)
     print(f"Average FLOPs for file {file_index}: {C:.4f} M")
 
@@ -139,9 +151,21 @@ def validate_model(model: nn.Module, data_loader: DataLoader, device: str) -> fl
             fro_norm = torch.linalg.norm(x_complex, ord='fro', dim=(1, 2)) + 1e-8
             x_normalized_complex = x_complex / fro_norm.view(-1, 1, 1)
             x_fft_complex = torch.fft.fft2(x_normalized_complex, norm='ortho')
+
+            x_mag = torch.abs(x_normalized_complex)
+            x_log_power = torch.log(x_mag ** 2 + 1e-8)
+            x_fft_mag = torch.abs(x_fft_complex)
+            x_fft_log_power = torch.log(x_fft_mag ** 2 + 1e-8)
+
             x_model_input = torch.stack([
-                x_normalized_complex.real, x_normalized_complex.imag,
-                x_fft_complex.real, x_fft_complex.imag
+                x_normalized_complex.real,
+                x_normalized_complex.imag,
+                x_mag,
+                x_log_power,
+                x_fft_complex.real,
+                x_fft_complex.imag,
+                x_fft_mag,
+                x_fft_log_power
             ], dim=1).float()
             x_normalized_for_sigma = torch.view_as_complex(
                 torch.stack([x_normalized_complex.real, x_normalized_complex.imag], dim=1).permute(0, 2, 3, 1).contiguous()

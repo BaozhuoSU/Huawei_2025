@@ -310,13 +310,13 @@ class SvdNet(nn.Module):
         self.M, self.N, self.r = M, N, r
 
         self.spatial_branch = nn.Sequential(
-            nn.Conv2d(2, 16, kernel_size=3, padding=1, stride=2, bias=False),  # 64x64 -> 32x32
+            nn.Conv2d(4, 16, kernel_size=3, padding=1, stride=2, bias=False),  # 64x64 -> 32x32
             nn.BatchNorm2d(16),
             nn.ReLU(),
             ResidualBlock(16, 32, stride=2)  # 32x32 -> 16x16
         )
         self.frequency_branch = nn.Sequential(
-            nn.Conv2d(2, 16, kernel_size=3, padding=1, stride=2, bias=False),  # 64x64 -> 32x32
+            nn.Conv2d(4, 16, kernel_size=3, padding=1, stride=2, bias=False),  # 64x64 -> 32x32
             nn.BatchNorm2d(16),
             nn.ReLU(),
             ResidualBlock(16, 32, stride=2)  # 32x32 -> 16x16
@@ -333,8 +333,8 @@ class SvdNet(nn.Module):
 
     def forward(self, x):
         # fea = self.enc(x)
-        x_spatial = x[:, 0:2, :, :]  # 前两个通道
-        x_freq = x[:, 2:4, :, :]  # 后两个通道
+        x_spatial = x[:, 0:4, :, :]
+        x_freq = x[:, 4:8, :, :]
         fea_spatial = self.spatial_branch(x_spatial)
         fea_freq = self.frequency_branch(x_freq)
         fea_concat = torch.cat([fea_spatial, fea_freq], dim=1)  # (B, 32+32, 16, 16)
@@ -462,11 +462,21 @@ def main(weight_path=None):
             fro_norm = torch.linalg.norm(x_complex, ord='fro', dim=(1, 2)) + 1e-8
             x_normalized_complex = x_complex / fro_norm.view(-1, 1, 1)
             x_fft_complex = torch.fft.fft2(x_normalized_complex, norm='ortho')
+
+            x_mag = torch.abs(x_normalized_complex)
+            x_log_power = torch.log(x_mag ** 2 + 1e-8)
+            x_fft_mag = torch.abs(x_fft_complex)
+            x_fft_log_power = torch.log(x_fft_mag ** 2 + 1e-8)
+
             x_out = torch.stack([
                 x_normalized_complex.real,
                 x_normalized_complex.imag,
+                x_mag,
+                x_log_power,
                 x_fft_complex.real,
-                x_fft_complex.imag
+                x_fft_complex.imag,
+                x_fft_mag,
+                x_fft_log_power
             ], dim=1).float()
             x_normalized = torch.stack([
                 x_normalized_complex.real,
@@ -512,13 +522,21 @@ def main(weight_path=None):
                 x_normalized_complex = x_complex / fro_norm.view(-1, 1, 1)
 
                 x_fft_complex = torch.fft.fft2(x_normalized_complex, norm='ortho')
-                x_model_input = torch.stack([
-                    x_normalized_complex.real, x_normalized_complex.imag,
-                    x_fft_complex.real, x_fft_complex.imag
-                ], dim=1).float()
 
-                x_normalized = torch.stack([
-                    x_normalized_complex.real, x_normalized_complex.imag
+                x_mag = torch.abs(x_normalized_complex)
+                x_log_power = torch.log(x_mag ** 2 + 1e-8)
+                x_fft_mag = torch.abs(x_fft_complex)
+                x_fft_log_power = torch.log(x_fft_mag ** 2 + 1e-8)
+
+                x_model_input = torch.stack([
+                    x_normalized_complex.real,
+                    x_normalized_complex.imag,
+                    x_mag,
+                    x_log_power,
+                    x_fft_complex.real,
+                    x_fft_complex.imag,
+                    x_fft_mag,
+                    x_fft_log_power
                 ], dim=1).float()
 
                 U, V = model(x_model_input)
@@ -557,6 +575,6 @@ LOG_DIR = f"model/{timestamp}"
 DATASET_DIR = "./CompetitionData1"
 
 if __name__ == "__main__":
-    model_path = "./svd_best_multi.pth"
-    # model_path = None
+    # model_path = "./svd_best_multi.pth"
+    model_path = None
     main(model_path)
