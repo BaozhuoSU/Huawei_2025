@@ -154,47 +154,6 @@ class ResidualBlock(nn.Module):
         return nn.functional.relu(self.shortcut(x) + self.path(x))
 
 
-# class GlobalDecoder(nn.Module):
-#     def __init__(self, in_channels, M, N, r, hidden_dim=512):
-#         super().__init__()
-#         self.r = r
-#         self.M = M
-#         self.N = N
-#
-#         self.pool = nn.AdaptiveAvgPool2d(1)
-#         self.flatten = nn.Flatten()
-#
-#         # output_dim = 2 * M * r + 2 * N * r  # 8192
-#         output_dim = 2 * M * r
-#         self.mlp = nn.Sequential(
-#             nn.Linear(in_channels, hidden_dim),
-#             nn.ReLU(),
-#             nn.Linear(hidden_dim, output_dim)
-#         )
-#
-#     def forward(self, x):
-#         # x: 输入特征图, shape (B, C, H, W), e.g., (B, 32, 8, 8)
-#         B = x.shape[0]
-#
-#         global_vec = self.flatten(self.pool(x))  # (B, C)
-#         output_vec = self.mlp(global_vec)  # (B, 8192)
-#
-#         p = 0
-#         U_r = output_vec[:, p:p + self.M * self.r].reshape(B, self.M, self.r)
-#         p += self.M * self.r
-#         U_i = output_vec[:, p:p + self.M * self.r].reshape(B, self.M, self.r)
-#         # p += self.M * self.r
-#         # V_r = output_vec[:, p:p + self.N * self.r].reshape(B, self.N, self.r)
-#         # p += self.N * self.r
-#         # V_i = output_vec[:, p:p + self.N * self.r].reshape(B, self.N, self.r)
-#
-#         U = torch.complex(U_r, U_i)
-#         # V = torch.complex(V_r, V_i)
-#         V = U.clone()
-#
-#         return U, V
-
-
 class AxisPoolDecoder(nn.Module):
     def __init__(self, M, N, r, feature_C=128, feature_H=8, feature_W=8, hidden_dim=512):
         super().__init__()
@@ -208,9 +167,9 @@ class AxisPoolDecoder(nn.Module):
         self.w_pool = nn.AdaptiveAvgPool2d((1, feature_W))
 
         # 输入维度 = 全局特征(C) + 轴向特征(H*C + W*C)
-        input_dim = feature_C + (feature_H * feature_C + feature_W * feature_C)  # 128 + 2048 = 2176
+        input_dim = feature_C + (feature_H * feature_C + feature_W * feature_C)  # 256 + 2048 + 2048 = 4352
         # output_dim = 2 * M * r + 2 * N * r
-        output_dim = 2 * M * r  #(4096)
+        output_dim = 2 * M * r  #(16384)
 
         self.mlp = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
@@ -219,16 +178,16 @@ class AxisPoolDecoder(nn.Module):
         )
 
     def forward(self, x):
-        # x: 输入特征图, shape (B, 128, 8, 8)
+        # x: 输入特征图, shape (B, feature_C, 8, 8)
         B = x.shape[0]
 
         # 提取三种特征
-        global_vec = self.global_pool(x).view(B, -1)  # (B, 128)
-        h_vec = self.h_pool(x).view(B, -1)  # (B, 1024)
-        w_vec = self.w_pool(x).view(B, -1)  # (B, 1024)
+        global_vec = self.global_pool(x).view(B, -1)  # (B, 256)
+        h_vec = self.h_pool(x).view(B, -1)  # (B, 2048)
+        w_vec = self.w_pool(x).view(B, -1)  # (B, 2048)
 
         # 拼接所有特征
-        hybrid_vec = torch.cat([global_vec, h_vec, w_vec], dim=1)  # (B, 2176)
+        hybrid_vec = torch.cat([global_vec, h_vec, w_vec], dim=1)  # (B, 4352)
 
         output_vec = self.mlp(hybrid_vec)
 
@@ -237,12 +196,8 @@ class AxisPoolDecoder(nn.Module):
         p += self.M * self.r
         U_i = output_vec[:, p:p + self.M * self.r].reshape(B, self.M, self.r)
         p += self.M * self.r
-        # V_r = output_vec[:, p:p + self.N * self.r].reshape(B, self.N, self.r)
-        # p += self.N * self.r
-        # V_i = output_vec[:, p:p + self.N * self.r].reshape(B, self.N, self.r)
 
         U = torch.complex(U_r, U_i)
-        # V = torch.complex(V_r, V_i)
         V = U.clone()
 
         return U, V
@@ -253,24 +208,25 @@ class SvdNet(nn.Module):
         self.M, self.N, self.r = M, N, r
 
         self.spatial_branch = nn.Sequential(
-            nn.Conv2d(2, 16, kernel_size=3, padding=1, stride=2, bias=False),  # 64x64 -> 32x32
-            nn.BatchNorm2d(16),
-            nn.ReLU(),
-            ResidualBlock(16, 32, stride=2)  # 32x32 -> 16x16
+            # nn.Conv2d(2, 16, kernel_size=3, padding=1, stride=2, bias=False),  # 128x128 -> 64x64
+            # nn.BatchNorm2d(16),
+            # nn.ReLU(),
+            ResidualBlock(2, 16, stride=2), # 128x128 -> 64x64
+            ResidualBlock(16, 32, stride=2)  # 64x64 -> 32x32
         )
         self.frequency_branch = nn.Sequential(
-            nn.Conv2d(2, 16, kernel_size=3, padding=1, stride=2, bias=False),  # 64x64 -> 32x32
-            nn.BatchNorm2d(16),
-            nn.ReLU(),
-            ResidualBlock(16, 32, stride=2)  # 32x32 -> 16x16
+            # nn.Conv2d(2, 16, kernel_size=3, padding=1, stride=2, bias=False),  # 128x128 -> 64x64
+            # nn.BatchNorm2d(16),
+            # nn.ReLU(),
+            ResidualBlock(2, 16, stride=2),  # 128x128 -> 64x64
+            ResidualBlock(16, 32, stride=2)  # 64x64 -> 32x32
         )
         self.shared_encoder = nn.Sequential(
-            ResidualBlock(64, 128, stride=2),  # 16x16 -> 8x8
-            ResidualBlock(128, 128, stride=1),
-            CBAM(128)
+            ResidualBlock(64, 128, stride=2),  # 32x32 -> 16x16
+            ResidualBlock(128, 256, stride=2),  # 16x16 -> 8x8
         )
 
-        fc_input_size = 128
+        fc_input_size = 256
         # self.decoder = GlobalDecoder(fc_input_size, M, N, r, hidden_dim=400)
         self.decoder = AxisPoolDecoder(M, N, r, feature_C=fc_input_size, feature_H=8, feature_W=8, hidden_dim=256)
 
@@ -303,6 +259,24 @@ def analytic_sigma(U, V, H):
     S = torch.clamp(raw_S, min=0.0)
     return S  # (B, r)
 
+def calculate_losses(U, S, V, H):
+    # --- 重构损失分量 ---
+    Sigma = torch.diag_embed(S.to(torch.complex64))
+    H_hat = U @ Sigma @ V.conj().permute(0, 2, 1)
+    num = torch.linalg.norm(H - H_hat, ord='fro', dim=(1, 2))
+    denom = torch.linalg.norm(H, ord='fro', dim=(1, 2)).clamp_min(1e-8)
+    recon_loss = (num / denom).mean()  # 对批次取平均
+
+    # --- 正交损失分量 ---
+    I_r = torch.eye(U.size(2), dtype=torch.complex64, device=H.device)
+    err_u = torch.linalg.norm(U.conj().permute(0, 2, 1) @ U - I_r, ord='fro', dim=(1, 2))
+    err_v = torch.linalg.norm(V.conj().permute(0, 2, 1) @ V - I_r, ord='fro', dim=(1, 2))
+    ortho_loss = (err_u + err_v).mean()  # 对批次取平均
+
+    return {
+        'recon': recon_loss,
+        'ortho': ortho_loss
+    }
 
 def ae_loss(U, S, V, H, lam=1.0):
     B = H.size(0)
@@ -339,9 +313,9 @@ def main(weight_path=None):
     # 1) 准备数据集
     # ROOTS = [Path.cwd() / f"data{i}" for i in (1, 2, 3)]
     train_sets = []
-    for idx in range(1, 4):
-        td = os.path.join(DATASET_DIR, f"Round1TrainData{idx}.npy")
-        tl = os.path.join(DATASET_DIR, f"Round1TrainLabel{idx}.npy")
+    for idx in range(1, 5):
+        td = os.path.join(DATASET_DIR, f"Round2TrainData{idx}.npy")
+        tl = os.path.join(DATASET_DIR, f"Round2TrainLabel{idx}.npy")
         train_sets.append(SimpleChannelDataset(td, tl))
     assert train_sets, "No training data found!"
 
@@ -361,7 +335,7 @@ def main(weight_path=None):
     # 2) 模型 & 优化器 & LR Scheduler
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"device: {device}")
-    M, Nmat, r = train_sets[0].M, train_sets[0].N, 32
+    M, Nmat, r = train_sets[0].M, train_sets[0].N, 64
 
     if weight_path:
         print(f"Loading model weights from {weight_path}")
@@ -384,10 +358,18 @@ def main(weight_path=None):
     best_loss, patience = float('inf'), 0
     for epoch in range(1, NUM_EPOCHS + 1):
         model.train()
-        running, count = 0.0, 0
+        count = 0
+        running_total, running_recon, running_ortho = 0.0, 0.0, 0.0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{NUM_EPOCHS}", ncols=80)
+        if epoch % 2 != 0:
+            # 奇数 epoch: 执行重构阶段 (Fit Phase)
+            pbar.set_description(f"Epoch {epoch}/{NUM_EPOCHS} [Fit Phase]")
+            current_phase = 'fit'
+        else:
+            # 偶数 epoch: 执行正交阶段 (Ortho Phase)
+            pbar.set_description(f"Epoch {epoch}/{NUM_EPOCHS} [Ortho Phase]")
+            current_phase = 'ortho'
         for x_raw, H in pbar:
-
             x_raw, H = x_raw.to(device), H.to(device)
             x_complex = torch.complex(x_raw[:, 0, :, :], x_raw[:, 1, :, :])
             fro_norm = torch.linalg.norm(x_complex, ord='fro', dim=(1, 2)) + 1e-8
@@ -397,12 +379,8 @@ def main(weight_path=None):
             x_out = torch.stack([
                 x_normalized_complex.real,
                 x_normalized_complex.imag,
-                # x_mag,
-                # x_log_power,
                 x_fft_complex.real,
                 x_fft_complex.imag,
-                # x_fft_mag,
-                # x_fft_log_power
             ], dim=1).float()
             x_normalized = torch.stack([
                 x_normalized_complex.real,
@@ -414,18 +392,30 @@ def main(weight_path=None):
             H_normalized = H / fro_norm.view(-1, 1, 1)
             S_norm = analytic_sigma(U, V, H_normalized)
             S = S_norm * fro_norm.unsqueeze(1)  # 恢复原始范数
-            loss = ae_loss(U, S, V, H)
-            # loss = supervised_ae_loss(U_ortho, V_ortho, S, H, U_raw, V_raw, lam=0.1)
+
+            loss_components = calculate_losses(U, S, V, H)
+            l_rec = loss_components['recon']
+            l_orth = loss_components['ortho']
+            if current_phase == 'fit':
+                loss = l_rec + 1e-3 * l_orth
+            else:
+                loss = l_orth
+
+            # loss = ae_loss(U, S, V, H)
             loss.backward()
             optimizer.step()
             scheduler.step()
 
             b = x_normalized.size(0)
-            running += loss.item() * b
+            running_total += loss.item() * b
+            running_recon += l_rec.item() * b
+            running_ortho += l_orth.item() * b
             count += b
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
+            pbar.set_postfix(L_total=f"{loss.item():.4f}", L_rec=f"{l_rec.item():.4f}", L_orth=f"{l_orth.item():.4f}")
 
-        train_loss = running / count
+        train_loss_total = running_total / count
+        train_loss_recon = running_recon / count
+        train_loss_ortho = running_ortho / count
 
         # 验证
         model.eval()
@@ -459,7 +449,12 @@ def main(weight_path=None):
         val_loss = v_sum / v_cnt
 
         # scheduler.step(val_loss)
-        print(f"Epoch {epoch} done — train_loss: {train_loss:.4f}, val_loss: {val_loss:.4f}")
+        # print(f"Epoch {epoch} done — train_loss: {train_loss:.4f}, val_loss: {val_loss:.4f}")
+        print(f"Epoch {epoch} done — "
+              f"train_loss: {train_loss_total:.4f}, "
+              f"train_loss_recon: {train_loss_recon:.4f}, "
+              f"train_loss_ortho: {train_loss_ortho:.4f}, "
+              f"val_loss: {val_loss:.4f}")
 
         # 保存最优
         if val_loss < best_loss:
@@ -469,7 +464,12 @@ def main(weight_path=None):
 
         with open(log_file, 'a') as f:
             f.write(
-                f"Epoch {epoch}: Train Loss : {train_loss:.6f} Val Loss: {val_loss:.6f}\n")
+                # f"Epoch {epoch}: Train Loss : {train_loss:.6f} Val Loss: {val_loss:.6f}\n")
+                f"Epoch {epoch}: "
+                f"Train Loss Total: {train_loss_total:.6f}, "
+                f"Train Loss Recon: {train_loss_recon:.6f}, "
+                f"Train Loss Ortho: {train_loss_ortho:.6f}, "
+                f"Val Loss: {val_loss:.6f}\n")
 
     print(f"Training complete, best val_loss = {best_loss:.4f}")
 
@@ -479,10 +479,10 @@ LEARNING_RATE = 3e-4
 # LEARNING_RATE = 3e-3
 BATCH_SIZE = 64
 timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-LOG_DIR = f"model/{timestamp}"
-DATASET_DIR = "./CompetitionData1"
+LOG_DIR = f"mode2/{timestamp}"
+DATASET_DIR = "./CompetitionData2"
 
 if __name__ == "__main__":
-    model_path = "./svd_best_multi.pth"
-    # model_path = None
+    # model_path = "./svd_best_multi.pth"
+    model_path = None
     main(model_path)

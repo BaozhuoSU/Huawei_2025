@@ -9,7 +9,7 @@ from torch import Tensor
 import numpy as np
 from torch.utils.data import DataLoader
 
-from su import SvdNet, ChannelSvdDataset, ae_loss, analytic_sigma, SimpleChannelDataset
+from su2 import SvdNet, ae_loss, analytic_sigma, SimpleChannelDataset
 
 
 def get_avg_flops(model: nn.Module, input_data: Tensor) -> float:
@@ -185,20 +185,20 @@ def validate_model(model: nn.Module, data_loader: DataLoader, device: str) -> fl
 
 
 if __name__ == "__main__":
-    DATA_DIR = './CompetitionData1'
+    DATA_DIR = './CompetitionData2'
     # MODEL_PATH = './model/model_epoch_422.pth'
     MODEL_PATH = './svd_best_multi.pth'
     OUTPUT_DIR = './outputs'
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    M, N, r = 64, 64, 32
+    M, N, r = 128, 128, 64
 
     model = load_model(MODEL_PATH, M, N, r)
 
-    for idx in range(1, 4):
-        data_path = os.path.join(DATA_DIR, f'Round1TrainData{idx}.npy')
-        label_path = os.path.join(DATA_DIR, f'Round1TrainLabel{idx}.npy')
+    for idx in range(1, 5):
+        data_path = os.path.join(DATA_DIR, f'Round2TrainData{idx}.npy')
+        label_path = os.path.join(DATA_DIR, f'Round2TrainLabel{idx}.npy')
 
         train_dataset = SimpleChannelDataset(
             data_path=data_path,
@@ -214,7 +214,7 @@ if __name__ == "__main__":
 
         mean_loss = validate_model(model, train_dataloader, DEVICE)
 
-        test_path = os.path.join(DATA_DIR, f'Round1TestData{idx}.npy')
+        test_path = os.path.join(DATA_DIR, f'Round2TestData{idx}.npy')
         test_dataset = SimpleChannelDataset(
             data_path=test_path,
         )

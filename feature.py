@@ -39,10 +39,14 @@ class ChannelSvdDataset(Dataset):
         else:
             return x
 
+
 if __name__ == "__main__":
     # 数据路径
     root = "./CompetitionData1"
     test_sets = []
+
+    # --- 新增：设置显示样本数量 ---
+    NUM_EXAMPLES_TO_SHOW = 3
 
     # 加载测试数据
     for idx in range(1, 2):
@@ -53,105 +57,43 @@ if __name__ == "__main__":
             print(f"Warning: {td} not found!")
     assert test_sets, "No test data found!"
 
-    # 计算 Frobenius 范数的 dB 值
-    h_db_values = []
-    h_db_sum = None
-    total_samples = 0
-    singular_values_all = []
-    U_all = []
-    Vt_all = []
-
     for i, dataset in enumerate(test_sets):
         print(f"Processing testData{i + 1}.npy...")
-        for idx in range(len(dataset)):
-            x = dataset[idx]  # (2, M, N)
-            # 将接收信号 X 转为复数形式
-            x_complex = torch.complex(x[0], x[1])  # (M, N)
-            # 计算每个元素的模 |H| = sqrt(real^2 + imag^2)
-            h_magnitude = torch.abs(x_complex)  # (64, 64)
-            # 转换为 dB: 10 * log10(|H|^2)
-            h_db = 10 * torch.log10(h_magnitude ** 2 + 1e-12)  # (64, 64)，加 1e-8 避免 log(0)
-            # 展平并收集所有值
-            h_db_values.extend(h_db.flatten().tolist())
+        # --- Modified: Loop only for the specified number of examples ---
+        for idx in range(min(NUM_EXAMPLES_TO_SHOW, len(dataset))):
+            print(f"  Displaying example #{idx + 1}")
 
-            if h_db_sum is None:
-                h_db_sum = h_db.clone()  # 初始化
-            else:
-                h_db_sum += h_db
-            total_samples += 1
+            # Get a sample from the dataset. We only need the label 'h' for visualization.
+            _, h = dataset[idx]  # Get (M, N) complex Tensor
+            H = h.numpy()  # Convert to numpy array
 
-            # SVD计算
-            h_magnitude_np = h_magnitude.numpy()  # 转换为numpy数组
-            U, s, Vt = np.linalg.svd(h_magnitude_np, full_matrices=False)  # SVD分解
-            singular_values_all.append(s)  # 存储奇异值
-            U_all.append(U)  # 存储左奇异向量
-            Vt_all.append(Vt)  # 存储右奇异向量的转置
+            # 2. Perform the 2D transform suggested by the hint to get the sparse representation
+            # Antenna domain -> Angular domain (FFT on axis=0)
+            # Frequency domain -> Delay domain (IFFT on axis=1)
+            # norm='ortho' option preserves energy
+            H_sparse = np.fft.ifft(np.fft.fft(H, axis=0, norm='ortho'), axis=1, norm='ortho')
 
-    # 转换为 numpy 数组以便统计
-    h_db_values = np.array(h_db_values)
-    singular_values_all = np.array(singular_values_all)
-    U_all = np.array(U_all)
-    Vt_all = np.array(Vt_all)
+            # 3. Create and display the plots
+            sns.set_style("whitegrid")
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+            fig.suptitle(f'Channel Sample #{idx + 1} Visualization', fontsize=16)
 
-    # 计算平均值
-    mean_h_db = h_db_sum / total_samples  # (64, 64)
-    mean_U = np.mean(U_all, axis=0)  # 平均左奇异向量
-    mean_S = np.mean(singular_values_all, axis=0)  # 平均奇异值
-    mean_Vt = np.mean(Vt_all, axis=0)  # 平均右奇异向量
-    mean_S_diag = np.zeros((64, 64))
-    np.fill_diagonal(mean_S_diag, mean_S)
-    # # 统计分析
-    # mean_db = np.mean(h_db_values)
-    # std_db = np.std(h_db_values)
-    # min_db = np.min(h_db_values)
-    # max_db = np.max(h_db_values)
-    # median_db = np.median(h_db_values)
-    #
-    # print("\n统计结果 (|H|_F in dB):")
-    # print(f"均值: {mean_db:.2f} dB")
-    # print(f"标准差: {std_db:.2f} dB")
-    # print(f"最小值: {min_db:.2f} dB")
-    # print(f"最大值: {max_db:.2f} dB")
-    # print(f"中位数: {median_db:.2f} dB")
+            # --- Plot 1: Original Channel Magnitude ---
+            im1 = ax1.imshow(np.abs(H), aspect='auto', cmap='viridis', interpolation='nearest')
+            ax1.set_title("Original Channel Magnitude (Antenna-Frequency Domain)")
+            ax1.set_xlabel("Frequency (Subcarrier) Index")
+            ax1.set_ylabel("Antenna Index")
+            fig.colorbar(im1, ax=ax1, label='Magnitude')
 
-    # 可视化：直方图
-    # plt.figure(figsize=(8, 6))
-    # plt.hist(h_db_values, bins=50, density=False, alpha=0.7, color='blue')
-    # plt.title('Distribution of |H| in dB')
-    # plt.xlabel('|H|_F (dB)')
-    # plt.ylabel('Density')
-    # plt.grid(True)
-    # plt.show()
+            # --- Plot 2: Sparse Representation ---
+            # Using np.fft.fftshift to move the zero-frequency component to the center for better visualization
+            im2 = ax2.imshow(np.abs(np.fft.fftshift(H_sparse)), aspect='auto', cmap='viridis', interpolation='nearest')
+            ax2.set_title("Sparse Representation (Angular-Delay Domain)")
+            ax2.set_xlabel("Delay Index (0 at center)")
+            ax2.set_ylabel("Angular Index (0 at center)")
+            fig.colorbar(im2, ax=ax2, label='Magnitude')
 
-    # mean_h_db = h_db_sum / total_samples  # (64, 64)
-    # mean_h_db_np = mean_h_db.numpy()  # 转为 numpy 数组以便可视化
-    # plt.figure(figsize=(8, 6))
-    # sns.heatmap(mean_h_db_np, cmap='viridis', cbar_kws={'label': '|H| (dB)'})
-    # plt.title('Average |H| in dB Across All Samples (64x64)')
-    # plt.xlabel('Column Index')
-    # plt.ylabel('Row Index')
-    # plt.show()
+            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+            plt.show()
 
-    # 2. 平均 U 热力图
-    plt.subplot(2, 2, 1)
-    sns.heatmap(mean_U, cmap='viridis', cbar_kws={'label': 'U Value'})
-    plt.title('Average U (Left Singular Vectors)')
-    plt.xlabel('Column Index')
-    plt.ylabel('Row Index')
 
-    # 3. 平均 S 热力图
-    plt.subplot(2, 2, 2)
-    sns.heatmap(mean_S_diag, cmap='viridis', cbar_kws={'label': 'Singular Value'})
-    plt.title('Average S (Singular Values)')
-    plt.xlabel('Singular Value Index')
-    plt.ylabel('Sample Index')
-
-    # 4. 平均 Vt 热力图
-    plt.subplot(2, 2, 3)
-    sns.heatmap(mean_Vt, cmap='viridis', cbar_kws={'label': 'Vt Value'})
-    plt.title('Average Vt (Right Singular Vectors)')
-    plt.xlabel('Column Index')
-    plt.ylabel('Row Index')
-
-    plt.tight_layout()
-    plt.show()
