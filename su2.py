@@ -198,9 +198,65 @@ class AxisPoolDecoder(nn.Module):
         p += self.M * self.r
 
         U = torch.complex(U_r, U_i)
+        U = F.normalize(U, p=2, dim=1)
+        U = bjorck_orthogonalize(U, iterations=2)
+
         V = U.clone()
 
         return U, V
+
+class GlobalDecoder(nn.Module):
+    def __init__(self, in_channels, M, N, r, hidden_dim=512):
+        super().__init__()
+        self.r = r
+        self.M = M
+        self.N = N
+
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.flatten = nn.Flatten()
+
+        output_dim = 2 * M * r
+        self.mlp = nn.Sequential(
+            nn.Linear(in_channels, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim)
+        )
+
+    def forward(self, x):
+        B = x.shape[0]
+
+        global_vec = self.flatten(self.pool(x))
+        output_vec = self.mlp(global_vec)
+
+        p = 0
+        U_r = output_vec[:, p:p + self.M * self.r].reshape(B, self.M, self.r)
+        p += self.M * self.r
+        U_i = output_vec[:, p:p + self.M * self.r].reshape(B, self.M, self.r)
+
+
+        U = torch.complex(U_r, U_i)
+        U = F.normalize(U, p=2, dim=1)
+        U = bjorck_orthogonalize(U, iterations=2)
+
+        V = U.clone()
+
+        return U, V
+
+
+def bjorck_orthogonalize(matrix, iterations=2):
+    """
+    Applies the Björck iterative orthogonalization process.
+    This function is differentiable and helps enforce orthogonality.
+    """
+    with torch.no_grad():  # The identity matrix should not require gradients
+        I = torch.eye(matrix.size(2), device=matrix.device, dtype=matrix.dtype)
+
+    for _ in range(iterations):
+        # The core update rule
+        matrix_T_matrix = matrix.conj().permute(0, 2, 1) @ matrix
+        correction = 0.5 * (I - matrix_T_matrix)
+        matrix = matrix @ (I + correction)
+    return matrix
 
 class SvdNet(nn.Module):
     def __init__(self, M=64, N=64, r=32):
@@ -227,8 +283,8 @@ class SvdNet(nn.Module):
         )
 
         fc_input_size = 256
-        # self.decoder = GlobalDecoder(fc_input_size, M, N, r, hidden_dim=400)
-        self.decoder = AxisPoolDecoder(M, N, r, feature_C=fc_input_size, feature_H=8, feature_W=8, hidden_dim=256)
+        self.decoder = GlobalDecoder(fc_input_size, M, N, r, hidden_dim=256)
+        # self.decoder = AxisPoolDecoder(M, N, r, feature_C=fc_input_size, feature_H=8, feature_W=8, hidden_dim=256)
 
     def forward(self, x):
         # fea = self.enc(x)
@@ -241,8 +297,6 @@ class SvdNet(nn.Module):
 
         U, V = self.decoder(fea)
 
-        U = F.normalize(U, p=2, dim=1)
-        V = F.normalize(V, p=2, dim=1)
         return U, V
 
 
@@ -474,7 +528,7 @@ def main(weight_path=None):
     print(f"Training complete, best val_loss = {best_loss:.4f}")
 
 
-NUM_EPOCHS = 100
+NUM_EPOCHS = 500
 LEARNING_RATE = 3e-4
 # LEARNING_RATE = 3e-3
 BATCH_SIZE = 64

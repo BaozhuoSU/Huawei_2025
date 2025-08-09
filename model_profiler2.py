@@ -65,35 +65,18 @@ def process_and_export(model: nn.Module, data_loader: DataLoader, output_path: s
 
     U_list, S_list, V_list = [], [], []
     with torch.no_grad():
-        # for x_norm, fro_norm in data_loader:
         for x_raw in data_loader:
-            # # print("Debug fro_norm:", fro_norm)
-            # x_norm, fro_norm = x_norm.to(device), fro_norm.to(device)
-            # U_pred, V_pred = model(x_norm)
-            # x_norm = x_norm.permute(0, 2, 3, 1).contiguous()
-            # x_norm_complex = torch.view_as_complex(x_norm)
-            # S_norm = analytic_sigma(U_pred, V_pred, x_norm_complex).to(device)
-            # S_pred = S_norm * fro_norm.unsqueeze(1)
             x_raw = x_raw.to(device)
             x_complex = torch.complex(x_raw[:, 0, :, :], x_raw[:, 1, :, :])
             fro_norm = torch.linalg.norm(x_complex, ord='fro', dim=(1, 2)) + 1e-8
             x_normalized_complex = x_complex / fro_norm.view(-1, 1, 1)
             x_fft_complex = torch.fft.fft2(x_normalized_complex, norm='ortho')
 
-            # x_mag = torch.abs(x_normalized_complex)
-            # x_log_power = torch.log(x_mag ** 2 + 1e-8)
-            # x_fft_mag = torch.abs(x_fft_complex)
-            # x_fft_log_power = torch.log(x_fft_mag ** 2 + 1e-8)
-
             x_model_input = torch.stack([
                 x_normalized_complex.real,
                 x_normalized_complex.imag,
-                # x_mag,
-                # x_log_power,
                 x_fft_complex.real,
                 x_fft_complex.imag,
-                # x_fft_mag,
-                # x_fft_log_power
             ], dim=1).float()
             x_normalized_for_sigma = torch.view_as_complex(
                 torch.stack([x_normalized_complex.real, x_normalized_complex.imag], dim=1).permute(0, 2, 3, 1).contiguous()
@@ -133,39 +116,19 @@ def validate_model(model: nn.Module, data_loader: DataLoader, device: str) -> fl
     num_samples = 0
 
     with torch.no_grad():
-        # for x_norm, H, fro_norm in data_loader:
         for x_raw, H_label in data_loader:
-            # x_norm, H, fro_norm = x_norm.to(device), H.to(device), fro_norm.to(device)
-            # U_pred, V_pred = model(x_norm)
-            # H_label = H
-            # x_norm = x_norm.permute(0, 2, 3, 1).contiguous()
-            # x_norm_complex = torch.view_as_complex(x_norm)
-            # S_norm = analytic_sigma(U_pred, V_pred, x_norm_complex).to(device)
-            # S_pred = S_norm * fro_norm.unsqueeze(1)
-            # loss = ae_loss(U_pred, S_pred, V_pred, H_label)
-            # b = x_norm.size(0)
-            # total_loss += loss.item() * b
-            # num_samples += b
+
             x_raw, H_label = x_raw.to(device), H_label.to(device)
             x_complex = torch.complex(x_raw[:, 0, :, :], x_raw[:, 1, :, :])
             fro_norm = torch.linalg.norm(x_complex, ord='fro', dim=(1, 2)) + 1e-8
             x_normalized_complex = x_complex / fro_norm.view(-1, 1, 1)
             x_fft_complex = torch.fft.fft2(x_normalized_complex, norm='ortho')
 
-            # x_mag = torch.abs(x_normalized_complex)
-            # x_log_power = torch.log(x_mag ** 2 + 1e-8)
-            # x_fft_mag = torch.abs(x_fft_complex)
-            # x_fft_log_power = torch.log(x_fft_mag ** 2 + 1e-8)
-
             x_model_input = torch.stack([
                 x_normalized_complex.real,
                 x_normalized_complex.imag,
-                # x_mag,
-                # x_log_power,
                 x_fft_complex.real,
                 x_fft_complex.imag,
-                # x_fft_mag,
-                # x_fft_log_power
             ], dim=1).float()
             x_normalized_for_sigma = torch.view_as_complex(
                 torch.stack([x_normalized_complex.real, x_normalized_complex.imag], dim=1).permute(0, 2, 3, 1).contiguous()
@@ -188,7 +151,7 @@ if __name__ == "__main__":
     DATA_DIR = './CompetitionData2'
     # MODEL_PATH = './model/model_epoch_422.pth'
     MODEL_PATH = './svd_best_multi.pth'
-    OUTPUT_DIR = './outputs'
+    OUTPUT_DIR = './outputs2'
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
