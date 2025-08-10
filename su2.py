@@ -14,47 +14,6 @@ import torch.nn.functional as F
 # 定义：ChannelSvdDataset
 # ———— 使用 mmap_mode 快速加载 .npy，不再 astype
 # =============================================================
-class ChannelSvdDataset(Dataset):
-    def __init__(self, data_path, label_path=None):
-        raw = np.load(data_path, mmap_mode='r')  # float32 (Ns, M, N, 2)
-        self.M, self.N = raw.shape[1], raw.shape[2]
-        # 转成 (Ns, 2, M, N)
-        self.X = raw.transpose(0, 3, 1, 2)
-        # 如果给出了 label_path，再加载 H
-        if label_path is not None:
-            lab = np.load(label_path, mmap_mode='r')
-            # 若 shape==(Ns,M,N,2) 则合成 complex
-            if lab.ndim == 4 and lab.shape[-1] == 2:
-                H_real = lab[..., 0]
-                H_imag = lab[..., 1]
-                self.H = (H_real + 1j * H_imag).astype(np.complex64)
-            else:
-                # 已经是 (Ns, M, N) complex 存储
-                self.H = lab
-        else:
-            self.H = None
-
-    def __len__(self):
-        return self.X.shape[0]
-
-    def __getitem__(self, idx):
-        x = torch.from_numpy(self.X[idx]).float()  # (2, M, N)
-        x_numpy = self.X[idx]  # (2, M, N)
-        x_complex = torch.complex(torch.from_numpy(x_numpy[0]), torch.from_numpy(x_numpy[1]))
-        fro_norm = torch.linalg.norm(x_complex, ord='fro') + 1e-8
-        x_normalized = x_complex / fro_norm
-        x_normalized = torch.stack([x_normalized.real, x_normalized.imag], dim=0).float()
-
-        if self.H is not None:
-            h = self.H[idx]  # complex64 (M, N)
-            h = torch.from_numpy(h)
-            # h_fro_norm = torch.linalg.norm(h, ord='fro') + 1e-8
-            # h_normalized = h / h_fro_norm
-            return x_normalized, h, fro_norm
-        else:
-            return x_normalized, fro_norm
-
-
 class SimpleChannelDataset(Dataset):
     def __init__(self, data_path, label_path=None):
         self.X = np.load(data_path, mmap_mode='r').transpose(0, 3, 1, 2)
@@ -153,58 +112,6 @@ class ResidualBlock(nn.Module):
         # 残差连接
         return nn.functional.relu(self.shortcut(x) + self.path(x))
 
-
-class AxisPoolDecoder(nn.Module):
-    def __init__(self, M, N, r, feature_C=128, feature_H=8, feature_W=8, hidden_dim=512):
-        super().__init__()
-        self.r, self.M, self.N = r, M, N
-
-        # 全局池化分支
-        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
-
-        # 轴向池化分支
-        self.h_pool = nn.AdaptiveAvgPool2d((feature_H, 1))
-        self.w_pool = nn.AdaptiveAvgPool2d((1, feature_W))
-
-        # 输入维度 = 全局特征(C) + 轴向特征(H*C + W*C)
-        input_dim = feature_C + (feature_H * feature_C + feature_W * feature_C)  # 256 + 2048 + 2048 = 4352
-        # output_dim = 2 * M * r + 2 * N * r
-        output_dim = 2 * M * r  #(16384)
-
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, output_dim)
-        )
-
-    def forward(self, x):
-        # x: 输入特征图, shape (B, feature_C, 8, 8)
-        B = x.shape[0]
-
-        # 提取三种特征
-        global_vec = self.global_pool(x).view(B, -1)  # (B, 256)
-        h_vec = self.h_pool(x).view(B, -1)  # (B, 2048)
-        w_vec = self.w_pool(x).view(B, -1)  # (B, 2048)
-
-        # 拼接所有特征
-        hybrid_vec = torch.cat([global_vec, h_vec, w_vec], dim=1)  # (B, 4352)
-
-        output_vec = self.mlp(hybrid_vec)
-
-        p = 0
-        U_r = output_vec[:, p:p + self.M * self.r].reshape(B, self.M, self.r)
-        p += self.M * self.r
-        U_i = output_vec[:, p:p + self.M * self.r].reshape(B, self.M, self.r)
-        p += self.M * self.r
-
-        U = torch.complex(U_r, U_i)
-        U = F.normalize(U, p=2, dim=1)
-        U = bjorck_orthogonalize(U, iterations=2)
-
-        V = U.clone()
-
-        return U, V
-
 class GlobalDecoder(nn.Module):
     def __init__(self, in_channels, M, N, r, hidden_dim=512):
         super().__init__()
@@ -233,30 +140,14 @@ class GlobalDecoder(nn.Module):
         p += self.M * self.r
         U_i = output_vec[:, p:p + self.M * self.r].reshape(B, self.M, self.r)
 
-
         U = torch.complex(U_r, U_i)
         U = F.normalize(U, p=2, dim=1)
-        U = bjorck_orthogonalize(U, iterations=2)
-
         V = U.clone()
 
         return U, V
 
 
-def bjorck_orthogonalize(matrix, iterations=2):
-    """
-    Applies the Björck iterative orthogonalization process.
-    This function is differentiable and helps enforce orthogonality.
-    """
-    with torch.no_grad():  # The identity matrix should not require gradients
-        I = torch.eye(matrix.size(2), device=matrix.device, dtype=matrix.dtype)
 
-    for _ in range(iterations):
-        # The core update rule
-        matrix_T_matrix = matrix.conj().permute(0, 2, 1) @ matrix
-        correction = 0.5 * (I - matrix_T_matrix)
-        matrix = matrix @ (I + correction)
-    return matrix
 
 class SvdNet(nn.Module):
     def __init__(self, M=64, N=64, r=32):
@@ -284,9 +175,9 @@ class SvdNet(nn.Module):
 
         fc_input_size = 256
         self.decoder = GlobalDecoder(fc_input_size, M, N, r, hidden_dim=256)
-        # self.decoder = AxisPoolDecoder(M, N, r, feature_C=fc_input_size, feature_H=8, feature_W=8, hidden_dim=256)
 
     def forward(self, x):
+        B = x.shape[0]
         # fea = self.enc(x)
         x_spatial = x[:, 0:2, :, :]
         x_freq = x[:, 2:4, :, :]
@@ -298,7 +189,6 @@ class SvdNet(nn.Module):
         U, V = self.decoder(fea)
 
         return U, V
-
 
 # =============================================================
 # 定义：自监督 AE Loss
@@ -384,7 +274,7 @@ def main(weight_path=None):
     )
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
     # 2) 模型 & 优化器 & LR Scheduler
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -414,7 +304,7 @@ def main(weight_path=None):
         model.train()
         count = 0
         running_total, running_recon, running_ortho = 0.0, 0.0, 0.0
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{NUM_EPOCHS}", ncols=80)
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{NUM_EPOCHS}")
         if epoch % 2 != 0:
             # 奇数 epoch: 执行重构阶段 (Fit Phase)
             pbar.set_description(f"Epoch {epoch}/{NUM_EPOCHS} [Fit Phase]")
@@ -455,6 +345,7 @@ def main(weight_path=None):
             else:
                 loss = l_orth
 
+            # loss = l_rec
             # loss = ae_loss(U, S, V, H)
             loss.backward()
             optimizer.step()
@@ -528,7 +419,7 @@ def main(weight_path=None):
     print(f"Training complete, best val_loss = {best_loss:.4f}")
 
 
-NUM_EPOCHS = 500
+NUM_EPOCHS = 1000
 LEARNING_RATE = 3e-4
 # LEARNING_RATE = 3e-3
 BATCH_SIZE = 64
@@ -537,6 +428,6 @@ LOG_DIR = f"mode2/{timestamp}"
 DATASET_DIR = "./CompetitionData2"
 
 if __name__ == "__main__":
-    # model_path = "./svd_best_multi.pth"
-    model_path = None
+    model_path = "./svd_best_multi.pth"
+    # model_path = None
     main(model_path)
